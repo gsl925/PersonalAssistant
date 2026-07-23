@@ -1,0 +1,700 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import uuid
+from pathlib import Path
+from typing import Any
+
+from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.adapters.factory import AdapterFactory
+from backend.config import settings
+from backend.knowledge import crud
+from backend.model_router import AllProvidersFailedError, ModelRouter
+from backend.skill_schemas import normalize_agent_output
+from backend.skills_loader import SkillDefinition, SkillsLoader
+
+# ---------------------------------------------------------------------------
+# Confidence thresholds (SDD §4.1)
+# ---------------------------------------------------------------------------
+
+_AUTO_THRESHOLD = 0.8
+_CONFIRM_THRESHOLD = 0.4
+
+# Minimum semantic similarity to create a relation link
+_RELATION_THRESHOLD = 0.7
+
+# Max retries for transient LLM / DB failures
+_MAX_RETRIES = 2
+_RETRY_DELAY = 1.5  # seconds between retries
+
+# ---------------------------------------------------------------------------
+# Fast-lane: input types that bypass LLM routing entirely
+# ---------------------------------------------------------------------------
+
+_FAST_LANE: dict[str, tuple[str, float]] = {
+    "image":      ("screenshot-agent", 1.0),
+    "photo":      ("screenshot-agent", 1.0),
+    "screenshot": ("screenshot-agent", 1.0),
+    "audio":      ("meeting-agent",    1.0),
+    "voice":      ("meeting-agent",    1.0),
+    "video":      ("meeting-agent",    1.0),
+    "url":        ("webclip-agent",    0.95),
+    "file":       ("document-agent",   0.90),
+    "doc":        ("document-agent",   0.90),
+    "document":   ("document-agent",   0.90),
+}
+
+
+# ---------------------------------------------------------------------------
+# Internal state holder for pending confirmations
+# ---------------------------------------------------------------------------
+
+class _PendingConfirmation:
+    """Holds routing info for a document awaiting user confirmation via Telegram."""
+
+    __slots__ = ("doc_id", "skill_name", "processed")
+
+    def __init__(self, doc_id: uuid.UUID, skill_name: str | None, processed: Any) -> None:
+        self.doc_id = doc_id
+        self.skill_name = skill_name
+        self.processed = processed
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+class Orchestrator:
+    """Central routing and execution brain for the Personal AI Assistant.
+
+    Responsibilities
+    ----------------
+    1. Save raw input to PostgreSQL immediately (fail-safe).
+    2. Route to the correct agent via fast-lane heuristics or LLM classification.
+    3. Execute the agent (with retry logic).
+    4. Post-process: auto-tagging, LLM project classification, embedding, relations.
+    5. Return a status dict suitable for Telegram / REST callers.
+    """
+
+    def __init__(
+        self,
+        model_router: ModelRouter,
+        skills_loader: SkillsLoader,
+        qdrant_client: Any,
+        session_maker: Any,
+    ) -> None:
+        self.model_router = model_router
+        self.skills_loader = skills_loader
+        self.qdrant = qdrant_client
+        self._session_maker = session_maker
+        # doc_id (str) → _PendingConfirmation awaiting user confirmation
+        self.pending_confirmations: dict[str, _PendingConfirmation] = {}
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    async def process_input(
+        self,
+        input_type: str,
+        input_data: Any,
+        user_context: dict | None = None,
+    ) -> dict:
+        """Main entry point.
+
+        Parameters
+        ----------
+        input_type:
+            One of: image, photo, screenshot, audio, voice, url, file, doc,
+            document, text, note.
+        input_data:
+            The raw payload — a file Path, a URL string, or plain text.
+        user_context:
+            Optional caller metadata (telegram user_id, chat_id, etc.).
+
+        Returns
+        -------
+        dict with keys:
+            status          "completed" | "pending_confirmation" | "failed"
+            doc_id          str (UUID)
+            message         Human-readable summary (may be Traditional Chinese)
+            agent_name      present when status is "pending_confirmation"
+            confidence      present when status is "pending_confirmation"
+            available_agents  present when no confident match was found
+        """
+        # 1. Persist a stub record immediately so every input is traceable.
+        source_type = self._normalize_source_type(input_type)
+        doc_id: uuid.UUID | None = None
+
+        try:
+            async with self._session_maker() as db:
+                doc = await crud.create_document(
+                    db,
+                    source_type=source_type,
+                    processing_status="pending",
+                )
+                await db.commit()
+                doc_id = doc.id
+            logger.info("Saved raw input stub — doc_id={} source_type={}", doc_id, source_type)
+        except Exception as exc:
+            logger.error("Failed to create document stub: {}", exc)
+            return {"status": "failed", "doc_id": None, "message": f"Database error: {exc}"}
+
+        # 2. Run the adapter to normalise the raw input. Flip to "processing"
+        # first so a poller can tell "actively transcribing/extracting" apart
+        # from "still queued" — adapter.process() can take minutes for audio
+        #/video (whisper transcription), during which nothing else updates.
+        try:
+            async with self._session_maker() as db:
+                await crud.update_document_status(db, doc_id, "processing")
+                await db.commit()
+
+            adapter = AdapterFactory.get_adapter(
+                input_type, self.model_router, settings.UPLOADS_DIR
+            )
+            processed = await adapter.process(input_data)
+        except Exception as exc:
+            logger.exception("Adapter failed for doc {}: {}", doc_id, exc)
+            await self._mark_failed(doc_id, str(exc))
+            return {"status": "failed", "doc_id": str(doc_id), "message": str(exc)}
+
+        # File uploads are saved to disk under a collision-free UUID filename
+        # before reaching the adapter, so the adapter can only derive a title
+        # from that UUID stem. Recover the human-readable original filename
+        # here as a fallback title (the agent's own inferred title, once
+        # available, takes priority — see _execute_and_save).
+        original_filename = (user_context or {}).get("original_filename")
+        if original_filename:
+            processed.title = Path(original_filename).stem
+
+        # 3. Route: decide which agent should handle this content.
+        try:
+            agent_name, confidence = await self._route(input_type, processed.original_content)
+            logger.info(
+                "Routing decision — doc={} agent='{}' confidence={:.2f}",
+                doc_id, agent_name, confidence,
+            )
+        except Exception as exc:
+            logger.warning("Routing failed for doc {}, falling back to note-agent: {}", doc_id, exc)
+            agent_name, confidence = "note-agent", 0.3
+
+        # 4. Act on confidence level.
+        if confidence >= _AUTO_THRESHOLD:
+            # High confidence → execute immediately.
+            try:
+                agent_result = await self._execute_and_save(doc_id, agent_name, processed)
+                return {
+                    "status": "completed",
+                    "doc_id": str(doc_id),
+                    "message": f"已儲存至知識庫 (agent: {agent_name})",
+                    "agent_name": agent_name,
+                    "title": agent_result.get("title") or processed.title,
+                    "summary": agent_result.get("summary"),
+                    "category": agent_result.get("category"),
+                    "tags": agent_result.get("suggested_tags"),
+                }
+            except Exception as exc:
+                logger.exception("Auto-execution failed for doc {}: {}", doc_id, exc)
+                await self._mark_failed(doc_id, str(exc))
+                return {"status": "failed", "doc_id": str(doc_id), "message": str(exc)}
+
+        elif confidence >= _CONFIRM_THRESHOLD:
+            # Medium confidence → ask user to confirm via Telegram inline buttons.
+            self.pending_confirmations[str(doc_id)] = _PendingConfirmation(
+                doc_id, agent_name, processed
+            )
+            return {
+                "status": "pending_confirmation",
+                "doc_id": str(doc_id),
+                "agent_name": agent_name,
+                "confidence": confidence,
+                "message": (
+                    f"請確認處理方式 (建議: {agent_name}, "
+                    f"信心度: {confidence:.0%})"
+                ),
+            }
+
+        else:
+            # Low / no confidence → list all agents for manual selection.
+            enabled_names = [s.name for s in self.skills_loader.get_enabled_skills()]
+            self.pending_confirmations[str(doc_id)] = _PendingConfirmation(
+                doc_id, None, processed
+            )
+            return {
+                "status": "pending_confirmation",
+                "doc_id": str(doc_id),
+                "agent_name": None,
+                "available_agents": enabled_names,
+                "message": "無法自動判斷處理方式，請手動選擇 agent",
+            }
+
+    async def confirm_routing(self, doc_id: str, agent_name: str) -> dict:
+        """Called when the user confirms an agent selection via Telegram.
+
+        Parameters
+        ----------
+        doc_id:
+            UUID string of the document awaiting confirmation.
+        agent_name:
+            The agent the user selected (must be an enabled skill).
+
+        Returns
+        -------
+        Status dict compatible with :meth:`process_input`.
+        """
+        pending = self.pending_confirmations.pop(doc_id, None)
+        if pending is None:
+            logger.warning("confirm_routing called for unknown doc_id={}", doc_id)
+            return {
+                "status": "failed",
+                "doc_id": doc_id,
+                "message": f"No pending task for doc_id={doc_id}",
+            }
+
+        try:
+            agent_result = await self._execute_and_save(pending.doc_id, agent_name, pending.processed)
+            return {
+                "status": "completed",
+                "doc_id": doc_id,
+                "message": f"已用 {agent_name} 完成處理",
+                "agent_name": agent_name,
+                "title": agent_result.get("title") or pending.processed.title,
+                "summary": agent_result.get("summary"),
+                "category": agent_result.get("category"),
+                "tags": agent_result.get("suggested_tags"),
+            }
+        except Exception as exc:
+            logger.exception("Confirmed execution failed for doc {}: {}", doc_id, exc)
+            await self._mark_failed(pending.doc_id, str(exc))
+            return {"status": "failed", "doc_id": doc_id, "message": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Routing
+    # ------------------------------------------------------------------
+
+    async def _route(self, input_type: str, content: str) -> tuple[str, float]:
+        """Return (agent_name, confidence) for the given input.
+
+        Fast-lane rules (deterministic, no LLM call):
+          image / photo / screenshot → screenshot-agent  (1.0)
+          audio / voice              → meeting-agent     (1.0)
+          url                        → webclip-agent     (0.95)
+          file / doc / document      → document-agent    (0.90)
+          text (short, < 200 chars)  → note-agent        (0.85)
+          text (long)                → LLM classify
+
+        Any other unrecognised type falls through to LLM routing.
+        """
+        key = input_type.lower()
+
+        # Deterministic fast-lane
+        if key in _FAST_LANE:
+            return _FAST_LANE[key]
+
+        # Text: short content → note, long → LLM
+        if key in ("text", "note"):
+            stripped = (content or "").strip()
+            if len(stripped) < 200:
+                return "note-agent", 0.85
+            return await self._llm_route(stripped)
+
+        # Unknown type: delegate to LLM
+        return await self._llm_route(content or "")
+
+    async def _llm_route(self, content: str) -> tuple[str, float]:
+        """Use a fast_text LLM to classify content against enabled agent descriptions.
+
+        Returns (agent_name, confidence).  Falls back to note-agent at 0.3 on
+        any failure so the pipeline always has somewhere to route.
+        """
+        enabled = self.skills_loader.get_enabled_skills()
+        if not enabled:
+            logger.warning("No enabled skills found; falling back to note-agent")
+            return "note-agent", 0.5
+
+        descriptions = "\n".join(
+            f"- {s.name}: {s.description}" for s in enabled
+        )
+        prompt = (
+            "You are a content-routing assistant. Given the content snippet below, "
+            "decide which agent is best suited to handle it.\n\n"
+            f"Available agents:\n{descriptions}\n\n"
+            f"Content (first 500 chars):\n{content[:500]}\n\n"
+            "Respond with ONLY valid JSON (no markdown fences):\n"
+            '{"agent_name": "<exact name from list above>", "confidence": <0.0-1.0>}'
+        )
+
+        try:
+            raw = await self.model_router.chat(
+                "fast_text",
+                [{"role": "user", "content": prompt}],
+                temperature=0,
+            )
+            # Extract the JSON object even if the model wrapped it in prose.
+            match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+                agent = str(data["agent_name"])
+                conf = float(data["confidence"])
+                # Validate agent name is actually in the enabled list
+                enabled_names = {s.name for s in enabled}
+                if agent not in enabled_names:
+                    logger.warning(
+                        "LLM returned unknown agent '{}'; falling back to note-agent", agent
+                    )
+                    return "note-agent", 0.3
+                return agent, conf
+        except (AllProvidersFailedError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            logger.warning("LLM routing failed: {}", exc)
+
+        return "note-agent", 0.3
+
+    # ------------------------------------------------------------------
+    # Execution (with retry)
+    # ------------------------------------------------------------------
+
+    async def _execute_and_save(
+        self,
+        doc_id: uuid.UUID,
+        agent_name: str,
+        processed: Any,
+    ) -> dict:
+        """Run the agent and persist all results.  Retries up to _MAX_RETRIES times."""
+        skill = self.skills_loader.get_skill(agent_name)
+        if skill is None:
+            raise ValueError(f"Agent '{agent_name}' not found or is disabled.")
+
+        # Mark as processing
+        async with self._session_maker() as db:
+            await crud.update_document_status(
+                db,
+                doc_id,
+                "processing",
+                title=processed.title,
+                original_content=processed.original_content,
+                file_path=processed.file_path,
+                source_url=processed.source_url,
+                agent_used=agent_name,
+            )
+            await db.commit()
+
+        # Run the agent with retry logic
+        agent_result = await self._execute_agent_with_retry(skill, processed)
+
+        # Persist structured results
+        async with self._session_maker() as db:
+            await crud.update_document_status(
+                db,
+                doc_id,
+                "completed",
+                title=agent_result.get("title") or processed.title,
+                summary=agent_result.get("summary"),
+                category=agent_result.get("category"),
+                type_specific_data=agent_result.get("type_specific_data"),
+            )
+            # Tags
+            tags = agent_result.get("suggested_tags") or []
+            if tags:
+                await crud.add_tags(db, doc_id, tags)
+
+            # LLM-assisted project classification against the existing project list
+            project_name = await self._classify_project(
+                db, agent_result, processed
+            )
+            if project_name:
+                project = await crud.get_or_create_project(db, project_name)
+                await crud.link_document_project(
+                    db,
+                    doc_id,
+                    project.id,
+                    confidence=agent_result.get("project_confidence"),
+                )
+
+            await db.commit()
+
+        # Post-process asynchronously (embedding + Qdrant + relations)
+        # Failures here are non-critical and must not block the response.
+        await self._post_process(doc_id, processed, agent_result)
+
+        return agent_result
+
+    async def _execute_agent_with_retry(
+        self,
+        skill: SkillDefinition,
+        processed: Any,
+        max_retries: int = _MAX_RETRIES,
+    ) -> dict:
+        """Call _execute_agent with exponential back-off retry on transient failures."""
+        last_exc: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                return await self._execute_agent(skill, processed)
+            except AllProvidersFailedError as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    delay = _RETRY_DELAY * (2 ** attempt)
+                    logger.warning(
+                        "Agent '{}' attempt {}/{} failed (AllProvidersFailedError). "
+                        "Retrying in {:.1f}s…",
+                        skill.name, attempt + 1, max_retries + 1, delay,
+                    )
+                    await asyncio.sleep(delay)
+            except Exception as exc:
+                # Non-transient failure: surface immediately without retry
+                logger.warning("Agent '{}' non-transient failure: {}", skill.name, exc)
+                raise
+
+        logger.error(
+            "Agent '{}' exhausted {} retries. Using fallback output.",
+            skill.name, max_retries,
+        )
+        return self._fallback_result(processed)
+
+    async def _execute_agent(self, skill: SkillDefinition, processed: Any) -> dict:
+        """Run the actual agent work: call the LLM and extract structured output.
+
+        Each skill's own SKILL.md documents its own output_schema (e.g. a
+        meeting has ``attendees``/``decisions``, a document has
+        ``chunk_summaries``) — the LLM must follow *that* schema, not a generic
+        one, or the two instructions conflict and the model ends up satisfying
+        whichever it weighs more heavily. The raw output is then normalized via
+        :func:`normalize_agent_output` onto the generic fields (summary,
+        category, suggested_tags, ...) the rest of the pipeline relies on.
+        """
+        user_content = processed.original_content or ""
+        if processed.source_url:
+            user_content = f"URL: {processed.source_url}\n\n{user_content}"
+
+        messages = [
+            {
+                "role": "system",
+                "content": skill.system_prompt or "You are a helpful knowledge assistant.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Process the following content and return ONLY the JSON object "
+                    "described in the Output Format above — no markdown fences, "
+                    "no extra commentary, no keys beyond that schema.\n\n"
+                    f"{user_content[:4000]}"
+                ),
+            },
+        ]
+
+        raw = await self.model_router.chat(skill.model, messages, temperature=0.2)
+        # Extract the outermost JSON object, tolerating markdown code fences.
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group())
+                return normalize_agent_output(skill.output_schema, parsed)
+            except json.JSONDecodeError as exc:
+                logger.warning("Agent '{}' returned invalid JSON: {}", skill.name, exc)
+
+        return self._fallback_result(processed)
+
+    # ------------------------------------------------------------------
+    # Post-processing
+    # ------------------------------------------------------------------
+
+    async def _post_process(
+        self,
+        doc_id: uuid.UUID,
+        processed: Any,
+        agent_result: dict,
+    ) -> None:
+        """Generate embedding, store in Qdrant, find similar docs, add relations.
+
+        This is intentionally non-critical: any exception is logged and swallowed
+        so it never blocks the response returned to the user.
+        """
+        try:
+            # 1. Build the text to embed: summary + a slice of the original.
+            text_for_embedding = " ".join(filter(None, [
+                agent_result.get("summary", ""),
+                (processed.original_content or "")[:500],
+            ])).strip()
+
+            if not text_for_embedding:
+                logger.debug("No embeddable text for doc {}; skipping Qdrant.", doc_id)
+                return
+
+            # 2. Generate the embedding vector.
+            vector = await self.model_router.get_embedding(text_for_embedding)
+            doc_id_str = str(doc_id)
+
+            # 3. Upsert into Qdrant.
+            await self.qdrant.upsert_document(
+                doc_id=doc_id_str,
+                vector=vector,
+                payload={
+                    "title": processed.title,
+                    "summary": agent_result.get("summary", ""),
+                    "category": agent_result.get("category", ""),
+                    "source_type": processed.source_type,
+                },
+            )
+            logger.debug("Upserted doc {} into Qdrant.", doc_id)
+
+            # 4. Find semantically similar documents (score > threshold).
+            similar = await self.qdrant.search_similar(vector, limit=5)
+            if not similar:
+                return
+
+            # 5. Persist relation edges in PostgreSQL.
+            async with self._session_maker() as db:
+                for hit in similar:
+                    if hit["id"] == doc_id_str:
+                        continue  # skip self
+                    if hit["score"] < _RELATION_THRESHOLD:
+                        continue
+                    try:
+                        await crud.add_relation(
+                            db,
+                            doc_id,
+                            uuid.UUID(hit["id"]),
+                            "semantic",
+                            hit["score"],
+                        )
+                    except Exception as rel_exc:
+                        # A failed relation is never worth aborting the loop.
+                        logger.debug(
+                            "Skipping relation {} ↔ {}: {}",
+                            doc_id, hit["id"], rel_exc,
+                        )
+                await db.commit()
+            logger.debug(
+                "Post-processing complete for doc {} ({} similar docs checked).",
+                doc_id, len(similar),
+            )
+
+        except AllProvidersFailedError:
+            logger.warning(
+                "Embedding skipped for doc {} — all LLM providers failed.", doc_id
+            )
+        except Exception as exc:
+            logger.warning("Post-processing failed for doc {}: {}", doc_id, exc)
+
+    # ------------------------------------------------------------------
+    # LLM-assisted project classification
+    # ------------------------------------------------------------------
+
+    async def _classify_project(
+        self,
+        db: AsyncSession,
+        agent_result: dict,
+        processed: Any,
+    ) -> str | None:
+        """Choose the best-matching project using LLM + existing project list.
+
+        Falls back to the agent's own suggestion when the LLM call fails or
+        when no projects exist yet.
+
+        Returns a project name string, or None if no project is appropriate.
+        """
+        # The agent may have already suggested a project.
+        agent_suggestion = agent_result.get("suggested_project")
+        agent_confidence = float(agent_result.get("project_confidence") or 0.0)
+
+        # Fetch active projects to ground the classification.
+        try:
+            existing_projects = await crud.get_projects(db)
+        except Exception as exc:
+            logger.warning("Could not fetch project list: {}; using agent suggestion.", exc)
+            return agent_suggestion
+
+        # If no projects exist yet, trust the agent directly (it will create one).
+        if not existing_projects:
+            return agent_suggestion
+
+        project_list = "\n".join(f"- {p.name}" for p in existing_projects)
+        summary = agent_result.get("summary", "")
+        content_snippet = (processed.original_content or "")[:300]
+
+        prompt = (
+            "You are a project classifier. Given the document summary and the list "
+            "of existing projects, decide which project this document belongs to.\n\n"
+            f"Document summary:\n{summary}\n\n"
+            f"Content snippet:\n{content_snippet}\n\n"
+            f"Existing projects:\n{project_list}\n\n"
+            "Respond with ONLY valid JSON (no markdown fences):\n"
+            '{"project_name": "<exact name from list, or a new name, or null>", '
+            '"confidence": <0.0-1.0>}\n'
+            "Return null for project_name if this document does not clearly belong to any project."
+        )
+
+        try:
+            raw = await self.model_router.chat(
+                "fast_text",
+                [{"role": "user", "content": prompt}],
+                temperature=0,
+            )
+            match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+                project_name = data.get("project_name")
+                llm_confidence = float(data.get("confidence") or 0.0)
+                if project_name and llm_confidence >= 0.5:
+                    logger.debug(
+                        "LLM classified doc into project '{}' (conf={:.2f})",
+                        project_name, llm_confidence,
+                    )
+                    # Propagate the LLM confidence back so it is stored on the link.
+                    agent_result["project_confidence"] = llm_confidence
+                    return project_name
+        except (AllProvidersFailedError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            logger.warning("Project classification LLM call failed: {}", exc)
+
+        # Fall back to the agent's own suggestion if confidence is reasonable.
+        if agent_suggestion and agent_confidence >= 0.5:
+            return agent_suggestion
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _mark_failed(self, doc_id: uuid.UUID, reason: str) -> None:
+        """Persist a 'failed' status for a document, swallowing any DB errors."""
+        try:
+            async with self._session_maker() as db:
+                await crud.update_document_status(db, doc_id, "failed")
+                await db.commit()
+        except Exception as exc:
+            logger.error(
+                "Could not mark doc {} as failed (reason: {}): {}", doc_id, reason, exc
+            )
+
+    @staticmethod
+    def _normalize_source_type(input_type: str) -> str:
+        """Map user-facing input_type strings to canonical DB source_type values."""
+        mapping: dict[str, str] = {
+            "image":    "screenshot",
+            "photo":    "screenshot",
+            "audio":    "meeting",
+            "voice":    "meeting",
+            "video":    "meeting",
+            "url":      "webclip",
+            "file":     "doc",
+            "document": "doc",
+            "text":     "note",
+        }
+        return mapping.get(input_type.lower(), input_type.lower())
+
+    @staticmethod
+    def _fallback_result(processed: Any) -> dict:
+        """Minimal structured output used when the LLM agent call fails entirely."""
+        snippet = (processed.original_content or "")[:200]
+        return {
+            "summary": snippet,
+            "category": "General",
+            "suggested_tags": [],
+            "suggested_project": None,
+            "project_confidence": 0.0,
+            "type_specific_data": {},
+        }

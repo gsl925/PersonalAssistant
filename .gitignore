@@ -1,0 +1,69 @@
+# === 資料庫 & 向量庫資料（不上傳）===
+data/
+
+# === Python 虛擬環境 ===
+venv/
+
+# === 環境變數（含密碼）===
+.env
+.env.local
+*.env
+
+# === 機密設定 / 金鑰 ===
+settings.json
+credentials.json
+secrets.*
+*.key
+*.pem
+
+# === SQLite DB（如果之後用到）===
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# === Claude Code 本機設定（含個人權限清單，可能含機敏指令字串）===
+.claude/
+
+# === Python 編譯檔 ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# === 上傳的使用者檔案 ===
+uploads/
+
+# === 日誌 ===
+*.log
+logs/
+
+# === Qdrant 本機執行檔（如果放在此目錄）===
+qdrant.exe
+qdrant/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Windows ===
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# === macOS ===
+.DS_Store
+
+# === 測試 & 覆蓋率 ===
+.pytest_cache/
+.coverage
+htmlcov/
+
+# === Build / dist ===
+dist/
+build/
+*.egg-info/
+frontend/dist/

@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: assistant_postgres
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: knowledge_db
+      POSTGRES_USER: assistant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-assistant123}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    networks:
+      - assistant-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U assistant -d knowledge_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: assistant_qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    networks:
+      - assistant-net
+    restart: unless-stopped
+
+networks:
+  assistant-net:
+    driver: bridge
