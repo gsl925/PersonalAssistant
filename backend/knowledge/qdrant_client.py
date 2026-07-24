@@ -187,9 +187,9 @@ class KnowledgeQdrantClient:
         loop = asyncio.get_running_loop()
 
         def _search() -> list[dict[str, Any]]:
-            hits = self._get_client().search(
+            response = self._get_client().query_points(
                 collection_name=self.COLLECTION_NAME,
-                query_vector=query_vector,
+                query=query_vector,
                 limit=limit,
                 query_filter=qdrant_filter,
                 with_payload=True,
@@ -200,7 +200,7 @@ class KnowledgeQdrantClient:
                     "score": hit.score,
                     "payload": hit.payload or {},
                 }
-                for hit in hits
+                for hit in response.points
             ]
 
         try:

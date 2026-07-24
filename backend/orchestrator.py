@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import uuid
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,9 @@ _CONFIRM_THRESHOLD = 0.4
 # Minimum semantic similarity to create a relation link
 _RELATION_THRESHOLD = 0.7
 
+# Minimum number of shared keyword tags to create a "shared_tag" relation link
+_SHARED_TAG_MIN_COUNT = 2
+
 # Max retries for transient LLM / DB failures
 _MAX_RETRIES = 2
 _RETRY_DELAY = 1.5  # seconds between retries
@@ -46,6 +50,22 @@ _FAST_LANE: dict[str, tuple[str, float]] = {
     "file":       ("document-agent",   0.90),
     "doc":        ("document-agent",   0.90),
     "document":   ("document-agent",   0.90),
+}
+
+# ---------------------------------------------------------------------------
+# Reverse mapping: canonical DB source_type → a representative _route()/
+# AdapterFactory input_type, used by retry_document() to reconstruct the
+# original input_type from a persisted (failed) Document row.
+# ---------------------------------------------------------------------------
+
+_SOURCE_TYPE_TO_INPUT_TYPE: dict[str, str] = {
+    "screenshot": "screenshot",
+    "doc": "doc",
+    "note": "text",
+    "webclip": "url",
+    # audio/voice/video all route to meeting-agent at the same confidence, so
+    # any one of them is a faithful stand-in for re-routing a "meeting" doc.
+    "meeting": "audio",
 }
 
 
@@ -93,6 +113,8 @@ class Orchestrator:
         self._session_maker = session_maker
         # doc_id (str) → _PendingConfirmation awaiting user confirmation
         self.pending_confirmations: dict[str, _PendingConfirmation] = {}
+        # doc_id (str) → suggested project name awaiting user confirmation
+        self.pending_project_confirmations: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -159,7 +181,9 @@ class Orchestrator:
             processed = await adapter.process(input_data)
         except Exception as exc:
             logger.exception("Adapter failed for doc {}: {}", doc_id, exc)
-            await self._mark_failed(doc_id, str(exc))
+            # Persist the raw input reference even on failure — otherwise
+            # retry_document() has nothing to reconstruct from later.
+            await self._mark_failed(doc_id, str(exc), **self._raw_input_fields(input_type, input_data))
             return {"status": "failed", "doc_id": str(doc_id), "message": str(exc)}
 
         # File uploads are saved to disk under a collision-free UUID filename
@@ -171,7 +195,73 @@ class Orchestrator:
         if original_filename:
             processed.title = Path(original_filename).stem
 
-        # 3. Route: decide which agent should handle this content.
+        return await self._route_and_finalize(doc_id, input_type, processed)
+
+    async def retry_document(self, doc_id: str) -> dict:
+        """Manually re-run processing for a document stuck in ``"failed"`` status.
+
+        Reconstructs the adapter input from whatever was persisted on the
+        Document row (``file_path``, ``source_url``, or ``original_content``)
+        and re-runs routing + execution against the *same* doc_id — no new
+        document row is created, so history/relations aren't duplicated.
+        """
+        try:
+            doc_uuid = uuid.UUID(doc_id)
+        except ValueError:
+            return {"status": "failed", "doc_id": doc_id, "message": "Invalid doc_id"}
+
+        async with self._session_maker() as db:
+            doc = await crud.get_document(db, doc_uuid)
+
+        if doc is None:
+            return {"status": "failed", "doc_id": doc_id, "message": "Document not found"}
+        if doc.processing_status != "failed":
+            return {
+                "status": "failed",
+                "doc_id": doc_id,
+                "message": f"Document is not in 'failed' state (current: {doc.processing_status})",
+            }
+
+        if doc.file_path:
+            input_data: Any = doc.file_path
+        elif doc.source_url:
+            input_data = doc.source_url
+        else:
+            input_data = doc.original_content or ""
+
+        input_type = _SOURCE_TYPE_TO_INPUT_TYPE.get(doc.source_type, doc.source_type)
+
+        try:
+            async with self._session_maker() as db:
+                await crud.update_document_status(db, doc_uuid, "processing")
+                await db.commit()
+
+            adapter = AdapterFactory.get_adapter(
+                doc.source_type, self.model_router, settings.UPLOADS_DIR
+            )
+            processed = await adapter.process(input_data)
+        except Exception as exc:
+            logger.exception("Retry: adapter failed for doc {}: {}", doc_uuid, exc)
+            await self._mark_failed(doc_uuid, str(exc))
+            return {"status": "failed", "doc_id": doc_id, "message": str(exc)}
+
+        if doc.title:
+            processed.title = doc.title
+
+        return await self._route_and_finalize(doc_uuid, input_type, processed)
+
+    async def _route_and_finalize(
+        self,
+        doc_id: uuid.UUID,
+        input_type: str,
+        processed: Any,
+    ) -> dict:
+        """Route *processed* content to an agent and act on the resulting confidence.
+
+        Shared by :meth:`process_input` (fresh input) and :meth:`retry_document`
+        (re-running a previously failed document) so the confidence-tiering
+        logic lives in exactly one place.
+        """
         try:
             agent_name, confidence = await self._route(input_type, processed.original_content)
             logger.info(
@@ -182,12 +272,11 @@ class Orchestrator:
             logger.warning("Routing failed for doc {}, falling back to note-agent: {}", doc_id, exc)
             agent_name, confidence = "note-agent", 0.3
 
-        # 4. Act on confidence level.
         if confidence >= _AUTO_THRESHOLD:
             # High confidence → execute immediately.
             try:
                 agent_result = await self._execute_and_save(doc_id, agent_name, processed)
-                return {
+                result = {
                     "status": "completed",
                     "doc_id": str(doc_id),
                     "message": f"已儲存至知識庫 (agent: {agent_name})",
@@ -197,6 +286,10 @@ class Orchestrator:
                     "category": agent_result.get("category"),
                     "tags": agent_result.get("suggested_tags"),
                 }
+                pending_project = agent_result.get("_pending_project")
+                if pending_project:
+                    result["pending_project"] = pending_project
+                return result
             except Exception as exc:
                 logger.exception("Auto-execution failed for doc {}: {}", doc_id, exc)
                 await self._mark_failed(doc_id, str(exc))
@@ -257,7 +350,7 @@ class Orchestrator:
 
         try:
             agent_result = await self._execute_and_save(pending.doc_id, agent_name, pending.processed)
-            return {
+            result = {
                 "status": "completed",
                 "doc_id": doc_id,
                 "message": f"已用 {agent_name} 完成處理",
@@ -267,10 +360,62 @@ class Orchestrator:
                 "category": agent_result.get("category"),
                 "tags": agent_result.get("suggested_tags"),
             }
+            pending_project = agent_result.get("_pending_project")
+            if pending_project:
+                result["pending_project"] = pending_project
+            return result
         except Exception as exc:
             logger.exception("Confirmed execution failed for doc {}: {}", doc_id, exc)
             await self._mark_failed(pending.doc_id, str(exc))
             return {"status": "failed", "doc_id": doc_id, "message": str(exc)}
+
+    async def confirm_project(self, doc_id: str, project_name: str | None) -> dict:
+        """Called when the user responds to a project-confirmation prompt.
+
+        Parameters
+        ----------
+        doc_id:
+            UUID string of the document awaiting project confirmation.
+        project_name:
+            The project to link the document to (created if it doesn't exist
+            yet), or ``None`` if the user declined ("不歸類").
+        """
+        pending_name = self.pending_project_confirmations.pop(doc_id, None)
+        if pending_name is None:
+            logger.warning("confirm_project called for unknown doc_id={}", doc_id)
+            return {
+                "status": "failed",
+                "doc_id": doc_id,
+                "message": f"No pending project confirmation for doc_id={doc_id}",
+            }
+
+        if project_name is None:
+            return {"status": "completed", "doc_id": doc_id, "message": "已略過專案歸類"}
+
+        try:
+            async with self._session_maker() as db:
+                project = await crud.get_or_create_project(db, project_name)
+                await crud.link_document_project(db, uuid.UUID(doc_id), project.id)
+                await db.commit()
+            return {
+                "status": "completed",
+                "doc_id": doc_id,
+                "message": f"已加入專案「{project_name}」",
+            }
+        except Exception as exc:
+            logger.exception("confirm_project failed for doc {}: {}", doc_id, exc)
+            return {"status": "failed", "doc_id": doc_id, "message": str(exc)}
+
+    async def get_action_items(self, due_before: str | None = None) -> list[dict]:
+        """Aggregate action items across all completed meeting documents.
+
+        Shares its query/flatten logic with ``GET /api/knowledge/action-items``
+        (both call ``crud.list_action_items``) so a Telegram todo-intent query
+        and the REST endpoint never drift out of sync.
+        """
+        parsed_due_before = date.fromisoformat(due_before) if due_before else None
+        async with self._session_maker() as db:
+            return await crud.list_action_items(db, due_before=parsed_due_before)
 
     # ------------------------------------------------------------------
     # Routing
@@ -402,17 +547,23 @@ class Orchestrator:
                 await crud.add_tags(db, doc_id, tags)
 
             # LLM-assisted project classification against the existing project list
-            project_name = await self._classify_project(
+            project_name, project_confidence = await self._classify_project(
                 db, agent_result, processed
             )
             if project_name:
-                project = await crud.get_or_create_project(db, project_name)
-                await crud.link_document_project(
-                    db,
-                    doc_id,
-                    project.id,
-                    confidence=agent_result.get("project_confidence"),
-                )
+                if project_confidence >= _AUTO_THRESHOLD:
+                    project = await crud.get_or_create_project(db, project_name)
+                    await crud.link_document_project(
+                        db, doc_id, project.id, confidence=project_confidence,
+                    )
+                elif project_confidence >= _CONFIRM_THRESHOLD:
+                    # Medium confidence → ask the user via Telegram before linking.
+                    self.pending_project_confirmations[str(doc_id)] = project_name
+                    agent_result["_pending_project"] = {
+                        "project_name": project_name,
+                        "confidence": project_confidence,
+                    }
+                # else: too low-confidence to even suggest — leave unlinked.
 
             await db.commit()
 
@@ -542,10 +693,11 @@ class Orchestrator:
 
             # 4. Find semantically similar documents (score > threshold).
             similar = await self.qdrant.search_similar(vector, limit=5)
-            if not similar:
-                return
 
-            # 5. Persist relation edges in PostgreSQL.
+            # 5. Persist relation edges in PostgreSQL — two independent signals:
+            #    semantic similarity (Qdrant, above) and shared keyword tags
+            #    (PostgreSQL join, below). Both may fire for the same pair.
+            tags = agent_result.get("suggested_tags") or []
             async with self._session_maker() as db:
                 for hit in similar:
                     if hit["id"] == doc_id_str:
@@ -566,10 +718,25 @@ class Orchestrator:
                             "Skipping relation {} ↔ {}: {}",
                             doc_id, hit["id"], rel_exc,
                         )
+
+                if tags:
+                    shared = await crud.get_documents_sharing_tags(db, doc_id, tags)
+                    for other_id, shared_count in shared:
+                        if shared_count < _SHARED_TAG_MIN_COUNT:
+                            continue
+                        score = min(shared_count / len(tags), 1.0)
+                        try:
+                            await crud.add_relation(db, doc_id, other_id, "shared_tag", score)
+                        except Exception as rel_exc:
+                            logger.debug(
+                                "Skipping shared_tag relation {} ↔ {}: {}",
+                                doc_id, other_id, rel_exc,
+                            )
+
                 await db.commit()
             logger.debug(
-                "Post-processing complete for doc {} ({} similar docs checked).",
-                doc_id, len(similar),
+                "Post-processing complete for doc {} ({} similar docs checked, {} tags).",
+                doc_id, len(similar), len(tags),
             )
 
         except AllProvidersFailedError:
@@ -588,13 +755,17 @@ class Orchestrator:
         db: AsyncSession,
         agent_result: dict,
         processed: Any,
-    ) -> str | None:
+    ) -> tuple[str | None, float]:
         """Choose the best-matching project using LLM + existing project list.
 
         Falls back to the agent's own suggestion when the LLM call fails or
-        when no projects exist yet.
+        when no projects exist yet. Does **not** decide whether to auto-link,
+        ask for confirmation, or skip — that confidence-tiering decision is
+        made by the caller (:meth:`_execute_and_save`) using the same
+        ``_AUTO_THRESHOLD``/``_CONFIRM_THRESHOLD`` bands as agent routing.
 
-        Returns a project name string, or None if no project is appropriate.
+        Returns ``(project_name, confidence)`` — ``project_name`` is ``None``
+        when no candidate was found at all.
         """
         # The agent may have already suggested a project.
         agent_suggestion = agent_result.get("suggested_project")
@@ -605,11 +776,11 @@ class Orchestrator:
             existing_projects = await crud.get_projects(db)
         except Exception as exc:
             logger.warning("Could not fetch project list: {}; using agent suggestion.", exc)
-            return agent_suggestion
+            return agent_suggestion, agent_confidence
 
         # If no projects exist yet, trust the agent directly (it will create one).
         if not existing_projects:
-            return agent_suggestion
+            return agent_suggestion, agent_confidence
 
         project_list = "\n".join(f"- {p.name}" for p in existing_projects)
         summary = agent_result.get("summary", "")
@@ -638,37 +809,50 @@ class Orchestrator:
                 data = json.loads(match.group())
                 project_name = data.get("project_name")
                 llm_confidence = float(data.get("confidence") or 0.0)
-                if project_name and llm_confidence >= 0.5:
+                if project_name:
                     logger.debug(
                         "LLM classified doc into project '{}' (conf={:.2f})",
                         project_name, llm_confidence,
                     )
-                    # Propagate the LLM confidence back so it is stored on the link.
-                    agent_result["project_confidence"] = llm_confidence
-                    return project_name
+                    return project_name, llm_confidence
         except (AllProvidersFailedError, json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.warning("Project classification LLM call failed: {}", exc)
 
-        # Fall back to the agent's own suggestion if confidence is reasonable.
-        if agent_suggestion and agent_confidence >= 0.5:
-            return agent_suggestion
-
-        return None
+        # Fall back to the agent's own suggestion.
+        return agent_suggestion, agent_confidence
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    async def _mark_failed(self, doc_id: uuid.UUID, reason: str) -> None:
-        """Persist a 'failed' status for a document, swallowing any DB errors."""
+    async def _mark_failed(self, doc_id: uuid.UUID, reason: str, **extra: Any) -> None:
+        """Persist a 'failed' status for a document, swallowing any DB errors.
+
+        *extra* may carry ``file_path``/``source_url``/``original_content`` so
+        a later call to :meth:`retry_document` has something to reconstruct
+        the original input from.
+        """
         try:
             async with self._session_maker() as db:
-                await crud.update_document_status(db, doc_id, "failed")
+                await crud.update_document_status(db, doc_id, "failed", **extra)
                 await db.commit()
         except Exception as exc:
             logger.error(
                 "Could not mark doc {} as failed (reason: {}): {}", doc_id, reason, exc
             )
+
+    @staticmethod
+    def _raw_input_fields(input_type: str, input_data: Any) -> dict:
+        """Best-effort mapping of *input_data* onto the Document row's raw-input
+        columns, keyed by what kind of value each input_type actually carries."""
+        key = input_type.lower()
+        if key == "url":
+            return {"source_url": str(input_data)}
+        if key in ("text", "note"):
+            return {"original_content": str(input_data)}
+        # image/photo/screenshot/audio/voice/video/file/doc/document all pass
+        # a filesystem path as input_data.
+        return {"file_path": str(input_data)}
 
     @staticmethod
     def _normalize_source_type(input_type: str) -> str:

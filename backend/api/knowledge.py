@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -13,10 +13,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.knowledge import crud
 from backend.knowledge.db import get_db
 from backend.knowledge.models import Document, DocumentRelation, Project
+from backend.orchestrator import Orchestrator
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
 DbDep = Annotated[AsyncSession, Depends(get_db)]
+
+
+def _get_orchestrator() -> Orchestrator:
+    """FastAPI dependency — returns the app-level Orchestrator singleton."""
+    from backend.main import get_orchestrator  # imported lazily to avoid circular imports
+    return get_orchestrator()
+
+
+OrchestratorDep = Annotated[Orchestrator, Depends(_get_orchestrator)]
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +77,16 @@ class DocumentContentOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class RetryResponse(BaseModel):
+    status: str
+    doc_id: str
+    message: str
+    title: str | None = None
+    summary: str | None = None
+    category: str | None = None
+    tags: list[str] | None = None
+
+
 class DocumentListResponse(BaseModel):
     items: list[DocumentOut]
     skip: int
@@ -104,6 +124,21 @@ class MindmapResponse(BaseModel):
     center_id: str
     nodes: list[MindmapNode]
     edges: list[MindmapEdge]
+
+
+class ActionItemOut(BaseModel):
+    task: str
+    owner: str | None = None
+    due_date: str | None = None
+    source_doc_id: uuid.UUID
+    source_title: str | None = None
+    meeting_date: str | None = None
+    created_at: datetime
+
+
+class ActionItemListResponse(BaseModel):
+    items: list[ActionItemOut]
+    count: int
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +220,22 @@ async def get_document(
     if doc is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
     return _doc_to_out(doc)
+
+
+@router.post("/documents/{doc_id}/retry", response_model=RetryResponse)
+async def retry_document(
+    doc_id: uuid.UUID,
+    orchestrator: OrchestratorDep,
+) -> RetryResponse:
+    """Manually re-run processing for a document currently in ``"failed"`` status.
+
+    Reuses whatever was persisted (file_path / source_url / original_content)
+    instead of requiring the caller to re-upload anything.
+    """
+    result = await orchestrator.retry_document(str(doc_id))
+    if result.get("status") == "failed" and "not found" in result.get("message", "").lower():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["message"])
+    return RetryResponse(**result)
 
 
 @router.get("/documents/{doc_id}/content", response_model=DocumentContentOut)
@@ -300,6 +351,25 @@ async def get_timeline(
         limit=limit,
         count=len(docs),
     )
+
+
+@router.get("/action-items", response_model=ActionItemListResponse)
+async def list_action_items(
+    db: DbDep,
+    due_before: date | None = Query(
+        default=None,
+        description="Only include items whose due_date is on or before this date. Items with no due_date are always included.",
+    ),
+) -> ActionItemListResponse:
+    """Aggregate ``action_items`` across all completed meeting documents.
+
+    Only meeting-agent's output schema defines ``action_items`` — there is no
+    "done" flag anywhere in the data model, so this always reflects everything
+    ever extracted, not just outstanding ones.
+    """
+    raw_items = await crud.list_action_items(db, due_before=due_before)
+    items = [ActionItemOut(**raw) for raw in raw_items]
+    return ActionItemListResponse(items=items, count=len(items))
 
 
 @router.get("/mindmap/{doc_id}", response_model=MindmapResponse)

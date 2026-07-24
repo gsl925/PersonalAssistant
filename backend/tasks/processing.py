@@ -96,7 +96,8 @@ async def send_daily_digest(orchestrator=None) -> None:
         f"Today is {today_str}. Here are summaries of all content captured today:\n\n"
         + "\n\n".join(doc_lines)
         + "\n\nWrite a concise daily digest (3-5 paragraphs) highlighting key themes, "
-          "action items, and grouping related content."
+          "action items, and grouping related content. "
+          "請全部使用繁體中文撰寫，不要使用簡體中文或英文。"
     )
 
     model_router = ModelRouter()
@@ -153,12 +154,16 @@ async def _send_email(subject: str, body: str) -> None:
 
 
 def _smtp_send(msg: MIMEMultipart) -> None:
+    # Without an explicit timeout, a blocked/filtered outbound port (common on
+    # corporate networks) hangs this call — and its OS-level thread — forever,
+    # since a cancelled asyncio.wait_for() around run_in_executor() does not
+    # actually interrupt the underlying blocking socket call.
     try:
-        with smtplib.SMTP(settings.EMAIL_SMTP_HOST, settings.EMAIL_SMTP_PORT) as s:
+        with smtplib.SMTP(settings.EMAIL_SMTP_HOST, settings.EMAIL_SMTP_PORT, timeout=20) as s:
             s.ehlo()
             s.starttls()
             s.login(settings.EMAIL_USER, settings.EMAIL_PASSWORD)
             s.sendmail(settings.EMAIL_USER, settings.EMAIL_RECIPIENT, msg.as_string())
         logger.info("Email sent: {}", msg["Subject"])
-    except smtplib.SMTPException as exc:
+    except (smtplib.SMTPException, OSError) as exc:
         logger.error("SMTP error: {}", exc)

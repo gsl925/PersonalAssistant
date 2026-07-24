@@ -20,6 +20,7 @@ Public interface expected by the rest of the system
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -264,6 +265,8 @@ class PersonalAssistantBot:
     # Text handler
     # ------------------------------------------------------------------
 
+    _TODO_INTENT_PATTERN = re.compile(r"代辦|待辦|todo|to-do|action[\s-]?items?", re.IGNORECASE)
+
     async def handle_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -272,6 +275,8 @@ class PersonalAssistantBot:
         Decision logic
         --------------
         - Starts with http:// or https:// → webclip-agent via input_type="url"
+        - Looks like a todo/action-item query (e.g. "今天有沒有代辦事項") → answered
+          directly from the action-items aggregate, not saved as a note.
         - Everything else (short notes, questions, long text) → input_type="text"
           and let the orchestrator's LLM routing decide the agent.
         """
@@ -284,15 +289,21 @@ class PersonalAssistantBot:
                 logger.info("Text classified as URL: {:.80}", text)
                 result = await self.orchestrator.process_input("url", text)
                 prefix = "🔗 "
-            else:
-                await update.message.reply_text("📝 訊息已收到，正在處理...")
-                logger.info(
-                    "Text classified as note/query (len={}): {:.60}", len(text), text
-                )
-                result = await self.orchestrator.process_input("text", text)
-                prefix = "✅ 收到！"
+                await self._dispatch_result(update, result, prefix=prefix)
+                return
 
-            await self._dispatch_result(update, result, prefix=prefix)
+            if self._TODO_INTENT_PATTERN.search(text):
+                logger.info("Text classified as todo-intent query: {:.60}", text)
+                items = await self.orchestrator.get_action_items()
+                await update.message.reply_text(self._format_action_items(items))
+                return
+
+            await update.message.reply_text("📝 訊息已收到，正在處理...")
+            logger.info(
+                "Text classified as note/query (len={}): {:.60}", len(text), text
+            )
+            result = await self.orchestrator.process_input("text", text)
+            await self._dispatch_result(update, result, prefix="✅ 收到！")
 
         except Exception as exc:
             logger.exception("handle_text error: {}", exc)
@@ -305,9 +316,12 @@ class PersonalAssistantBot:
     async def handle_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle inline button presses for agent-selection confirmations.
+        """Handle inline button presses.
 
-        Expected ``callback_data`` format: ``confirm:{doc_id}:{agent_name}``
+        Two independent callback_data formats share this handler:
+          - ``confirm:{doc_id}:{agent_name}``   — agent-routing confirmation
+          - ``project:{doc_id}:{project_name}`` — project-assignment confirmation
+            (``project_name`` may be the sentinel ``__skip__`` for "不歸類")
         """
         query = update.callback_query
         await query.answer()
@@ -315,24 +329,36 @@ class PersonalAssistantBot:
         data: str = query.data or ""
         parts = data.split(":", 2)
 
-        if len(parts) != 3 or parts[0] != "confirm":
+        if len(parts) != 3 or parts[0] not in ("confirm", "project"):
             logger.warning("Unrecognised callback_data: {!r}", data)
             await query.edit_message_text("❓ 無效的操作。")
             return
 
-        _, doc_id, agent_name = parts
-        logger.info("User confirmed routing: doc_id={} agent={}", doc_id, agent_name)
+        kind, doc_id, payload = parts
 
+        if kind == "confirm":
+            logger.info("User confirmed routing: doc_id={} agent={}", doc_id, payload)
+            try:
+                result = await self.orchestrator.confirm_routing(doc_id, payload)
+                if result.get("status") == "completed":
+                    text = self._format_completed(result, prefix="✅ ")
+                else:
+                    text = f"❌ {result.get('message', '完成！')}"
+                await query.edit_message_text(text)
+            except Exception as exc:
+                logger.exception("handle_callback (confirm) error: {}", exc)
+                await query.edit_message_text(f"❌ 確認時發生錯誤：{exc}")
+            return
+
+        # kind == "project"
+        project_name = None if payload == "__skip__" else payload
+        logger.info("User responded to project confirmation: doc_id={} project={}", doc_id, project_name)
         try:
-            result = await self.orchestrator.confirm_routing(doc_id, agent_name)
-            if result.get("status") == "completed":
-                text = self._format_completed(result, prefix="✅ ")
-            else:
-                text = f"❌ {result.get('message', '完成！')}"
-            await query.edit_message_text(text)
-
+            result = await self.orchestrator.confirm_project(doc_id, project_name)
+            icon = "✅" if result.get("status") == "completed" else "❌"
+            await query.edit_message_text(f"{icon} {result.get('message', '完成！')}")
         except Exception as exc:
-            logger.exception("handle_callback error: {}", exc)
+            logger.exception("handle_callback (project) error: {}", exc)
             await query.edit_message_text(f"❌ 確認時發生錯誤：{exc}")
 
     # ------------------------------------------------------------------
@@ -394,6 +420,31 @@ class PersonalAssistantBot:
         keyboard = InlineKeyboardMarkup([[btn] for btn in buttons])
         await update.message.reply_text(
             "🤔 請選擇處理方式：",
+            reply_markup=keyboard,
+        )
+
+    async def send_project_confirmation_request(
+        self,
+        doc_id: str,
+        project_name: str,
+        confidence: float,
+        update: Update,
+    ) -> None:
+        """Ask the user to confirm a medium-confidence project assignment.
+
+        Mirrors :meth:`send_confirmation_request` but for project linking
+        instead of agent routing — SDD §7 requires this confirmation step
+        when project-classification confidence isn't high enough to auto-link.
+        """
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"✅ 加入「{project_name}」",
+                callback_data=f"project:{doc_id}:{project_name}",
+            )],
+            [InlineKeyboardButton("❌ 不歸類", callback_data=f"project:{doc_id}:__skip__")],
+        ])
+        await update.message.reply_text(
+            f"🗂️ 這份內容可能屬於專案「{project_name}」（信心度 {confidence:.0%}），要加入嗎？",
             reply_markup=keyboard,
         )
 
@@ -461,6 +512,14 @@ class PersonalAssistantBot:
 
         if status == "completed":
             await update.message.reply_text(self._format_completed(result, prefix))
+            pending_project = result.get("pending_project")
+            if pending_project:
+                await self.send_project_confirmation_request(
+                    result.get("doc_id", ""),
+                    pending_project["project_name"],
+                    float(pending_project.get("confidence", 0.0)),
+                    update,
+                )
 
         elif status == "pending_confirmation":
             doc_id: str = result.get("doc_id", "")
@@ -510,6 +569,32 @@ class PersonalAssistantBot:
             lines.append(f"📝 {snippet}")
         if tags:
             lines.append("🔖 " + "、".join(str(t) for t in tags))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_action_items(items: list[dict]) -> str:
+        """Build a reply listing aggregated meeting action items.
+
+        There is no "done" flag in the data model, so this always lists
+        everything ever extracted — same caveat as the REST endpoint.
+        """
+        if not items:
+            return "📋 目前沒有偵測到任何代辦事項（尚無會議紀錄含 action items）。"
+
+        items = sorted(items, key=lambda i: i.get("due_date") or "9999-99-99")
+
+        lines = [f"📋 代辦事項（共 {len(items)} 筆）："]
+        for item in items[:20]:
+            line = f"• {item['task']}"
+            if item.get("due_date"):
+                line += f"（📅 {item['due_date']}）"
+            if item.get("owner"):
+                line += f" @{item['owner']}"
+            if item.get("source_title"):
+                line += f"\n  來自：{item['source_title']}"
+            lines.append(line)
+        if len(items) > 20:
+            lines.append(f"...還有 {len(items) - 20} 筆，未列出")
         return "\n".join(lines)
 
     def _cache_chat_id(self, update: Update) -> None:

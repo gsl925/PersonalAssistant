@@ -104,6 +104,17 @@ async def update_capability_tiers(
     return CapabilityTiersResponse(tiers=new_tiers)
 
 
+@router.post("/trigger-digest", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_digest() -> dict:
+    """Manually run the daily digest job right now, instead of waiting for
+    the 08:00 Asia/Taipei APScheduler trigger."""
+    from backend.tasks.processing import send_daily_digest
+
+    logger.info("Daily digest manually triggered via API.")
+    await send_daily_digest()
+    return {"status": "triggered", "message": "Daily digest generated and sent."}
+
+
 @router.get("/ollama-models", response_model=OllamaModelsResponse)
 async def list_ollama_models() -> OllamaModelsResponse:
     """Query the local Ollama instance and return the list of installed models."""

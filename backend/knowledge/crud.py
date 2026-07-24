@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
-from typing import Sequence
+from datetime import date, datetime, timezone
+from typing import Any, Sequence
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -117,6 +117,60 @@ async def get_documents(
     return result.scalars().all()
 
 
+async def get_meeting_documents_with_action_items(db: AsyncSession) -> Sequence[Document]:
+    """Completed meeting documents that have any per-skill output stored —
+    callers flatten ``type_specific_data["action_items"]`` themselves since
+    only the meeting-agent schema defines that field."""
+    result = await db.execute(
+        select(Document)
+        .where(Document.source_type == "meeting")
+        .where(Document.processing_status == "completed")
+        .where(Document.type_specific_data.isnot(None))
+        .order_by(Document.created_at.desc())
+    )
+    return result.scalars().all()
+
+
+async def list_action_items(
+    db: AsyncSession, due_before: date | None = None
+) -> list[dict[str, Any]]:
+    """Aggregate ``action_items`` across all completed meeting documents.
+
+    Only meeting-agent's output schema defines ``action_items`` — there is no
+    "done" flag anywhere in the data model, so this always reflects everything
+    ever extracted, not just outstanding ones. Shared by the REST endpoint and
+    the Telegram bot's todo-intent shortcut so both stay in sync.
+    """
+    docs = await get_meeting_documents_with_action_items(db)
+
+    items: list[dict[str, Any]] = []
+    for doc in docs:
+        data = doc.type_specific_data or {}
+        meeting_date = data.get("meeting_date")
+        for raw in data.get("action_items") or []:
+            if not isinstance(raw, dict) or not raw.get("task"):
+                continue
+            due_date_str = raw.get("due_date")
+            if due_before is not None and due_date_str:
+                try:
+                    if date.fromisoformat(due_date_str[:10]) > due_before:
+                        continue
+                except ValueError:
+                    pass
+            items.append(
+                {
+                    "task": raw["task"],
+                    "owner": raw.get("owner"),
+                    "due_date": due_date_str,
+                    "source_doc_id": doc.id,
+                    "source_title": doc.title,
+                    "meeting_date": meeting_date,
+                    "created_at": doc.created_at,
+                }
+            )
+    return items
+
+
 async def get_documents_created_today(db: AsyncSession) -> Sequence[Document]:
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     result = await db.execute(
@@ -147,6 +201,31 @@ async def add_tags(db: AsyncSession, doc_id: uuid.UUID, keywords: list[str]) -> 
     if new_tags:
         db.add_all(new_tags)
         await db.flush()
+
+
+async def get_documents_sharing_tags(
+    db: AsyncSession,
+    doc_id: uuid.UUID,
+    keywords: list[str],
+    limit: int = 10,
+) -> Sequence[tuple[uuid.UUID, int]]:
+    """Return ``(other_doc_id, shared_tag_count)`` for documents that share at
+    least one of *keywords* with *doc_id*, ordered by most shared first."""
+    if not keywords:
+        return []
+    normalized = [kw.lower().strip() for kw in keywords if kw.strip()]
+    if not normalized:
+        return []
+
+    result = await db.execute(
+        select(DocumentTag.doc_id, func.count(DocumentTag.keyword).label("shared_count"))
+        .where(DocumentTag.keyword.in_(normalized))
+        .where(DocumentTag.doc_id != doc_id)
+        .group_by(DocumentTag.doc_id)
+        .order_by(func.count(DocumentTag.keyword).desc())
+        .limit(limit)
+    )
+    return [(row.doc_id, row.shared_count) for row in result]
 
 
 # ---------------------------------------------------------------------------
