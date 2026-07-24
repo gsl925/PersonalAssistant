@@ -67,3 +67,10 @@ dist/
 build/
 *.egg-info/
 frontend/dist/
+
+# === Node / Electron (frontend dashboard + desktop widget) ===
+node_modules/
+desktop/dist/
+desktop/out/
+*.local
+*.tsbuildinfo

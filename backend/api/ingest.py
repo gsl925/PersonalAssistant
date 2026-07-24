@@ -6,11 +6,12 @@ import uuid
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 from loguru import logger
 from pydantic import BaseModel, HttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.adapters.factory import AdapterFactory
 from backend.config import settings
 from backend.knowledge.db import get_db
 from backend.orchestrator import Orchestrator
@@ -82,8 +83,22 @@ async def ingest_text(
 async def ingest_file(
     file: UploadFile,
     orchestrator: OrchestratorDep,
+    input_type: Annotated[str | None, Form()] = None,
 ) -> IngestResponse:
-    """Accept an uploaded file, persist it to the uploads directory, then process it."""
+    """Accept an uploaded file, persist it to the uploads directory, then process it.
+
+    `input_type` is an optional override for callers that know better than
+    extension-sniffing which adapter should handle the file — e.g. the
+    desktop widget uploading a hotkey screenshot as a `.png`, which would
+    otherwise be auto-detected as a generic "file" and misrouted into
+    DocumentAdapter (PDF/DOCX only).
+    """
+    if input_type is not None and input_type.lower() not in AdapterFactory.registered_types():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unknown input_type={input_type!r}. Known: {AdapterFactory.supported_aliases()}",
+        )
+
     uploads_dir: Path = settings.UPLOADS_DIR
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
@@ -105,9 +120,11 @@ async def ingest_file(
         await file.close()
 
     logger.info("POST /api/ingest/file — saved '{}' → {}", file.filename, dest_path)
-    input_type = "video" if suffix.lower() in _VIDEO_EXTENSIONS else "file"
+    resolved_type = input_type.lower() if input_type else (
+        "video" if suffix.lower() in _VIDEO_EXTENSIONS else "file"
+    )
     result = await orchestrator.process_input(
-        input_type, str(dest_path), user_context={"original_filename": file.filename}
+        resolved_type, str(dest_path), user_context={"original_filename": file.filename}
     )
     return IngestResponse(**result)
 

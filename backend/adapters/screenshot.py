@@ -13,11 +13,21 @@ class ScreenshotAdapter(BaseAdapter):
 
     source_type = "screenshot"
 
+    # Deliberately a single-purpose OCR prompt — no "also describe the image"
+    # instruction mixed in. Asking a VLM to transcribe *and* interpret in one
+    # pass tends to make it blend/hallucinate ("PROPIÉTAR Y PRÁCTICOS
+    # SECRETANDORES" for garbled Chinese text was a real observed failure).
+    # Summarization/description now happens as a separate, later text-only
+    # LLM step (screenshot-agent's own system prompt) that reads this
+    # verbatim transcription as input — splitting "read accurately" from
+    # "interpret" into two focused steps instead of one vague one.
     _SYSTEM_PROMPT = (
-        "You are an expert at reading images and screenshots. "
-        "Extract ALL text visible in the image verbatim. "
-        "Then provide a brief description of what the image shows. "
-        "Format: first the extracted text, then a separator '---', then the description."
+        "You are an OCR engine. Transcribe ALL text visible in the image "
+        "exactly as it appears, preserving original language, line breaks, "
+        "and structure. Do not translate, summarize, paraphrase, or add any "
+        "commentary — output only the literal text. If the image contains no "
+        "readable text at all, instead write a short literal description of "
+        "what is visually shown (objects, layout, colors) with no text output."
     )
 
     async def process(self, image_path: Path) -> ProcessedContent:
@@ -35,7 +45,7 @@ class ScreenshotAdapter(BaseAdapter):
                     {"role": "system", "content": self._SYSTEM_PROMPT},
                     {
                         "role": "user",
-                        "content": "Please analyse this screenshot/image.",
+                        "content": "Transcribe all text in this image.",
                     },
                 ],
                 image_base64=image_b64,

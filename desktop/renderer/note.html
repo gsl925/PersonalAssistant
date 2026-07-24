@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        font-family: -apple-system, "Segoe UI", "Microsoft JhengHei", sans-serif;
+      }
+      body {
+        background: #1f2023;
+        color: #eee;
+        padding: 14px;
+        box-sizing: border-box;
+        border-radius: 8px;
+        border: 1px solid #333;
+      }
+      #input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px 10px;
+        border-radius: 6px;
+        border: 1px solid #444;
+        background: #111;
+        color: #eee;
+        font-size: 14px;
+      }
+      #drop {
+        margin-top: 8px;
+        border: 1px dashed #555;
+        border-radius: 6px;
+        padding: 8px;
+        font-size: 11px;
+        color: #888;
+        text-align: center;
+      }
+      #drop.hover {
+        border-color: #3b6fd9;
+        color: #3b6fd9;
+      }
+      #status {
+        font-size: 11px;
+        color: #6fa0ff;
+        margin-top: 6px;
+        height: 14px;
+      }
+      #hint {
+        font-size: 11px;
+        color: #666;
+        margin-top: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <input id="input" type="text" placeholder="快速筆記… (Enter 送出)" autofocus />
+    <div id="drop">或將檔案拖放到這裡</div>
+    <div id="status"></div>
+    <div id="hint">Esc 關閉</div>
+    <script src="note.js"></script>
+  </body>
+</html>
