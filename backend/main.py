@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import TYPE_CHECKING, Any, AsyncGenerator
+
+if TYPE_CHECKING:
+    from backend.bot.telegram_bot import PersonalAssistantBot
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +29,7 @@ _model_router: ModelRouter | None = None
 _skills_loader: SkillsLoader | None = None
 _qdrant_client: KnowledgeQdrantClient | None = None
 _orchestrator: Orchestrator | None = None
+_telegram_bot: "PersonalAssistantBot | None" = None
 
 
 def get_model_router() -> ModelRouter:
@@ -52,6 +56,12 @@ def get_orchestrator() -> Orchestrator:
     return _orchestrator
 
 
+def get_telegram_bot() -> "PersonalAssistantBot":
+    if _telegram_bot is None:
+        raise RuntimeError("Telegram bot not initialised — TELEGRAM_BOT_TOKEN not set, or app startup hasn't reached that step yet.")
+    return _telegram_bot
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -60,7 +70,7 @@ def get_orchestrator() -> Orchestrator:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Initialise services on startup and clean up (if needed) on shutdown."""
-    global _model_router, _skills_loader, _qdrant_client, _orchestrator  # noqa: PLW0603
+    global _model_router, _skills_loader, _qdrant_client, _orchestrator, _telegram_bot  # noqa: PLW0603
 
     # 1. Database tables
     logger.info("Initialising database tables…")
@@ -114,7 +124,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # 8. Telegram bot — runs on this same event loop (see telegram_bot.py
     # module docstring for why it must not run in a separate thread/loop).
-    _telegram_bot = None
     if settings.TELEGRAM_BOT_TOKEN:
         from backend.bot.telegram_bot import PersonalAssistantBot
         _telegram_bot = PersonalAssistantBot(

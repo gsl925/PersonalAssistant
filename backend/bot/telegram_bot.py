@@ -92,7 +92,11 @@ class PersonalAssistantBot:
         self.app: Application = ApplicationBuilder().token(token).build()
 
         # Populated from the first inbound message; used by send_message().
-        self._default_chat_id: int | None = None
+        # Persisted to disk (see _cache_chat_id) so it survives restarts —
+        # otherwise every restart would forget it and background senders
+        # (e.g. project_sync.py) would silently fall back to the broadcast
+        # TELEGRAM_CHAT_ID channel instead of this private/replyable chat.
+        self._default_chat_id: int | None = self._load_default_chat_id()
         # chat_ids that just tapped the "📌 新增代辦" quick-add button — their
         # NEXT text message is treated as explicit todo content instead of
         # going through the normal URL/query/ambient-detection routing.
@@ -798,8 +802,25 @@ class PersonalAssistantBot:
             lines.append(f"🔔 {label}提醒：{when}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _default_chat_id_path() -> Path:
+        return settings.BASE_DIR / "data" / "telegram_default_chat_id.txt"
+
+    @classmethod
+    def _load_default_chat_id(cls) -> int | None:
+        path = cls._default_chat_id_path()
+        if not path.exists():
+            return None
+        try:
+            return int(path.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            return None
+
     def _cache_chat_id(self, update: Update) -> None:
         """Record the chat_id of the first inbound message as the default outbound target."""
         if self._default_chat_id is None and update.effective_chat:
             self._default_chat_id = update.effective_chat.id
             logger.debug("Default chat_id cached: {}", self._default_chat_id)
+            path = self._default_chat_id_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(str(self._default_chat_id), encoding="utf-8")

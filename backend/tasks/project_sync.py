@@ -41,6 +41,21 @@ def _progress_path(project: TrackedProject) -> Path:
     return Path(project.repo_path) / PROGRESS_FILENAME
 
 
+async def _send_relay(text: str) -> None:
+    """Send to the user's private/replyable chat with the bot (needed here
+    since "💬 待溝通/建議" and "📋 進度回報" both expect a reply back), not the
+    broadcast-only TELEGRAM_CHAT_ID digest channel that _send_telegram()
+    defaults to. Falls back to that channel if the bot isn't up yet (e.g.
+    this runs as a background task that can fire before the bot finishes
+    starting) or TELEGRAM_BOT_TOKEN isn't configured at all."""
+    try:
+        from backend.main import get_telegram_bot
+
+        await get_telegram_bot().send_message(text)
+    except RuntimeError:
+        await _send_telegram(text)
+
+
 def _split_sections(text: str) -> dict[str, str]:
     """Split on the three fixed ## headers. Missing headers just yield an
     empty section rather than raising — a malformed file should degrade to
@@ -109,7 +124,7 @@ async def _relay_discuss_items(project: TrackedProject, full_text: str, pstate: 
     for bullet in _extract_bullets(sections[_DISCUSS_HEADER]):
         if bullet["checked"]:
             continue
-        await _send_telegram(f"💬 [{project.label}] 需要你決定：{bullet['content']}\n\n#{project.name}")
+        await _send_relay(f"💬 [{project.label}] 需要你決定：{bullet['content']}\n\n#{project.name}")
         checked_line = bullet["raw_line"].replace("- [ ]", "- [x]", 1)
         full_text = full_text.replace(bullet["raw_line"], checked_line, 1)
         pstate["awaiting_decision"].append(
@@ -127,7 +142,7 @@ async def _maybe_relay_report(project: TrackedProject, full_text: str, pstate: d
     updated_at = _extract_updated_at(sections[_REPORT_HEADER])
     if not updated_at or updated_at == pstate.get("last_report_time"):
         return
-    await _send_telegram(
+    await _send_relay(
         f"📋 [{project.label}] 進度更新\n\n{sections[_REPORT_HEADER]}\n\n#{project.name}"
     )
     pstate["last_report_time"] = updated_at
