@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld("api", {
   ingestText: (text) => ipcRenderer.invoke("ingest-text", text),
   ingestUrl: (url) => ipcRenderer.invoke("ingest-url", url),
   ingestFilePath: (filePath) => ipcRenderer.invoke("ingest-file-path", filePath),
+  createTodo: (text) => ipcRenderer.invoke("create-todo", text),
   getPathForFile: (file) => webUtils.getPathForFile(file),
   closeWindow: () => ipcRenderer.invoke("close-current-window"),
   // Screenshot overlay only:

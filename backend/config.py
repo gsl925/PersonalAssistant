@@ -30,6 +30,17 @@ DEFAULT_CAPABILITY_TIERS: CapabilityTiers = {
         {"provider": "ollama_local", "model": "qwen3-vl:8b"},
         {"provider": "ollama_local", "model": "llava:7b"},
     ],
+    # Literal text transcription (screenshot-agent's OCR step). Separate from
+    # "vision" above — general VLMs (qwen3-vl, llava) confabulate a plausible
+    # but fictional narrative on dense/small-text screenshots instead of
+    # admitting they can't read it; minicpm-v is specifically OCR-tuned and
+    # stayed grounded in the real content on the same test image (live-tested
+    # 2026-07-28 against a real dense screenshot — qwen3-vl/deepseek-ocr both
+    # invented entirely fictional content, minicpm-v got most of it right).
+    "ocr": [
+        {"provider": "ollama_local", "model": "minicpm-v:8b"},
+        {"provider": "ollama_local", "model": "qwen3-vl:8b"},
+    ],
     "embedding": [
         {"provider": "ollama_local", "model": "bge-m3"},
     ],
@@ -78,6 +89,9 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
+    # Separate destination for todo reminders so they don't mix in with the
+    # daily digest. Falls back to TELEGRAM_CHAT_ID when unset.
+    TELEGRAM_TODO_CHAT_ID: str = ""
 
     # ------------------------------------------------------------------
     # Email (SMTP)
@@ -128,6 +142,19 @@ class Settings(BaseSettings):
     CAPABILITY_TIERS: CapabilityTiers = Field(
         default_factory=lambda: DEFAULT_CAPABILITY_TIERS
     )
+
+    # ------------------------------------------------------------------
+    # Screenshot OCR engine
+    # ------------------------------------------------------------------
+    # "tesseract" (deterministic, local, no LLM call) or "vlm" (generative,
+    # uses the "ocr" capability tier above). Kept switchable rather than a
+    # hard replacement — VLM-OCR models are improving quickly and the user
+    # wants to keep re-testing them; see project memory 2026-07-28.
+    SCREENSHOT_OCR_ENGINE: str = "tesseract"
+    # Path to the tesseract binary. Only needed on Windows where it's not on
+    # PATH by default; leave empty to use whatever `tesseract` resolves to.
+    TESSERACT_CMD: str = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    TESSERACT_LANG: str = "chi_tra+chi_sim+eng"
 
 
 # ---------------------------------------------------------------------------

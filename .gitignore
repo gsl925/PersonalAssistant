@@ -74,3 +74,5 @@ desktop/dist/
 desktop/out/
 *.local
 *.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts

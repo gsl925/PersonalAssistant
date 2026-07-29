@@ -4,9 +4,10 @@ import asyncio
 import json
 import re
 import uuid
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +35,17 @@ _SHARED_TAG_MIN_COUNT = 2
 # Max retries for transient LLM / DB failures
 _MAX_RETRIES = 2
 _RETRY_DELAY = 1.5  # seconds between retries
+
+# ---------------------------------------------------------------------------
+# Todo reminder defaults
+# ---------------------------------------------------------------------------
+
+_TAIPEI = ZoneInfo("Asia/Taipei")
+_TODO_REMINDER_HOUR = 9  # 09:00 Asia/Taipei, matching the daily-digest morning cadence
+# If a todo's start→due span exceeds this many days, add one extra reminder
+# at the midpoint so a long-running task doesn't go completely unmentioned
+# between the start and the day-before-deadline reminders.
+_TODO_MIDPOINT_GAP_DAYS = 7
 
 # ---------------------------------------------------------------------------
 # Fast-lane: input types that bypass LLM routing entirely
@@ -115,6 +127,8 @@ class Orchestrator:
         self.pending_confirmations: dict[str, _PendingConfirmation] = {}
         # doc_id (str) → suggested project name awaiting user confirmation
         self.pending_project_confirmations: dict[str, str] = {}
+        # confirmation_id (str) → extracted todo fields awaiting user confirmation
+        self.pending_todo_confirmations: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -416,6 +430,360 @@ class Orchestrator:
         parsed_due_before = date.fromisoformat(due_before) if due_before else None
         async with self._session_maker() as db:
             return await crud.list_action_items(db, due_before=parsed_due_before)
+
+    # ------------------------------------------------------------------
+    # Quick-capture todos
+    # ------------------------------------------------------------------
+
+    # Cheap pre-filter for the ambient Telegram path — date-like tokens or
+    # todo-ish keywords. Only messages that trip this pay for an LLM call;
+    # explicit paths (desktop/dashboard/the /todo command) skip it entirely
+    # since intent is already unambiguous there.
+    _TODO_CREATE_HINT_PATTERN = re.compile(
+        r"提醒我|記得|別忘了|截止|deadline|due|期限|申請|開放|\d{1,2}[/\-]\d{1,2}",
+        re.IGNORECASE,
+    )
+
+    async def extract_todo_fields(self, text: str) -> dict:
+        """Extract todo content + dates from free text via a fast_text LLM call.
+
+        Deliberately does not ask the LLM to compute ``remind_at`` itself —
+        date arithmetic is unreliable coming out of a small model, so that's
+        derived deterministically in Python (:meth:`_compute_reminders`).
+        """
+        today = datetime.now(_TAIPEI).date().isoformat()
+        prompt = (
+            f"Today's date is {today} (Asia/Taipei). Extract the task and any "
+            "date range from the following message.\n\n"
+            f"Message:\n{text[:1000]}\n\n"
+            "Respond with ONLY valid JSON (no markdown fences):\n"
+            '{"content": "<short task description>", '
+            '"start_date": "<YYYY-MM-DD or null>", '
+            '"due_date": "<YYYY-MM-DD or null>"}\n'
+            "Resolve relative dates (e.g. \"明天\", \"下週三\") against today's date. "
+            "content 請使用繁體中文撰寫，不要使用簡體中文或英文（專有名詞可保留原文）。"
+        )
+        try:
+            raw = await self.model_router.chat(
+                "fast_text", [{"role": "user", "content": prompt}], temperature=0,
+            )
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+                return {
+                    "content": str(data.get("content") or text[:200]).strip(),
+                    "start_date": self._parse_date(data.get("start_date")),
+                    "due_date": self._parse_date(data.get("due_date")),
+                }
+        except (AllProvidersFailedError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            logger.warning("Todo extraction failed: {}", exc)
+        return {"content": text[:200].strip(), "start_date": None, "due_date": None}
+
+    async def classify_todo_intent(self, text: str) -> dict:
+        """One LLM call that both decides "is this a todo" and extracts fields.
+
+        Used only by the ambient Telegram free-text path — explicit paths call
+        :meth:`extract_todo_fields` directly since intent is already known.
+        """
+        today = datetime.now(_TAIPEI).date().isoformat()
+        prompt = (
+            f"Today's date is {today} (Asia/Taipei). Decide whether the message "
+            "below describes a task or deadline the user wants to remember (a "
+            "todo), as opposed to a general note, question, or casual chat.\n\n"
+            f"Message:\n{text[:1000]}\n\n"
+            "Respond with ONLY valid JSON (no markdown fences):\n"
+            '{"is_todo": <true|false>, "confidence": <0.0-1.0>, '
+            '"content": "<short task description>", '
+            '"start_date": "<YYYY-MM-DD or null>", "due_date": "<YYYY-MM-DD or null>"}\n'
+            "Resolve relative dates against today's date. If is_todo is false, "
+            "content/start_date/due_date may be null. "
+            "content 請使用繁體中文撰寫，不要使用簡體中文或英文（專有名詞可保留原文）。"
+        )
+        try:
+            raw = await self.model_router.chat(
+                "fast_text", [{"role": "user", "content": prompt}], temperature=0,
+            )
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+                return {
+                    "is_todo": bool(data.get("is_todo")),
+                    "confidence": float(data.get("confidence") or 0.0),
+                    "content": str(data.get("content") or text[:200]).strip(),
+                    "start_date": self._parse_date(data.get("start_date")),
+                    "due_date": self._parse_date(data.get("due_date")),
+                }
+        except (AllProvidersFailedError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            logger.warning("Todo intent classification failed: {}", exc)
+        return {
+            "is_todo": False, "confidence": 0.0,
+            "content": None, "start_date": None, "due_date": None,
+        }
+
+    async def create_todo_from_text(self, text: str, source: str) -> dict:
+        """Explicit-intent todo creation — used by the desktop widget, the
+        dashboard quick-add form, and Telegram's ``/todo`` command. Intent is
+        already known here, so this skips straight to extraction with no
+        is_todo classification step."""
+        fields = await self.extract_todo_fields(text)
+        return await self._persist_todo(
+            content=fields["content"],
+            source=source,
+            raw_input=text,
+            start_date=fields["start_date"],
+            due_date=fields["due_date"],
+        )
+
+    async def maybe_create_todo_from_message(self, text: str, source: str = "telegram") -> dict:
+        """Ambient todo detection for free Telegram text.
+
+        Returns ``{"status": "not_todo"}`` immediately if the cheap regex
+        pre-filter doesn't match or the LLM decides it isn't a todo — the
+        caller's normal note/webclip routing is untouched in that case.
+        """
+        if not self._TODO_CREATE_HINT_PATTERN.search(text):
+            return {"status": "not_todo"}
+
+        classification = await self.classify_todo_intent(text)
+        if not classification["is_todo"]:
+            return {"status": "not_todo"}
+
+        confidence = classification["confidence"]
+        if confidence >= _AUTO_THRESHOLD:
+            result = await self._persist_todo(
+                content=classification["content"],
+                source=source,
+                raw_input=text,
+                start_date=classification["start_date"],
+                due_date=classification["due_date"],
+            )
+            result["status"] = "auto_created"
+            return result
+
+        if confidence >= _CONFIRM_THRESHOLD:
+            confirmation_id = str(uuid.uuid4())
+            self.pending_todo_confirmations[confirmation_id] = {
+                "content": classification["content"],
+                "source": source,
+                "raw_input": text,
+                "start_date": classification["start_date"],
+                "due_date": classification["due_date"],
+            }
+            return {
+                "status": "pending_confirmation",
+                "confirmation_id": confirmation_id,
+                "content": classification["content"],
+                "due_date": (
+                    classification["due_date"].isoformat()
+                    if classification["due_date"] else None
+                ),
+            }
+
+        return {"status": "not_todo"}
+
+    async def confirm_todo(self, confirmation_id: str, accept: bool) -> dict:
+        """Called when the user responds to a todo-creation confirmation via
+        Telegram inline buttons (medium-confidence ambient detection)."""
+        pending = self.pending_todo_confirmations.pop(confirmation_id, None)
+        if pending is None:
+            logger.warning("confirm_todo called for unknown confirmation_id={}", confirmation_id)
+            return {
+                "status": "failed",
+                "message": f"No pending todo confirmation for {confirmation_id}",
+            }
+        if not accept:
+            return {"status": "cancelled"}
+
+        result = await self._persist_todo(
+            content=pending["content"],
+            source=pending["source"],
+            raw_input=pending["raw_input"],
+            start_date=pending["start_date"],
+            due_date=pending["due_date"],
+        )
+        result["status"] = "auto_created"
+        return result
+
+    async def get_todos(
+        self, status: str | None = "pending", due_before: str | None = None
+    ) -> list[dict]:
+        parsed_due_before = date.fromisoformat(due_before) if due_before else None
+        async with self._session_maker() as db:
+            todos = await crud.list_todos(db, status=status, due_before=parsed_due_before)
+        return [
+            {
+                "id": str(t.id),
+                "content": t.content,
+                "status": t.status,
+                "start_date": t.start_date.isoformat() if t.start_date else None,
+                "due_date": t.due_date.isoformat() if t.due_date else None,
+                "source": t.source,
+                "source_url": t.source_url,
+                "created_at": t.created_at,
+                "reminders": [
+                    {"label": r.label, "remind_at": r.remind_at.astimezone(_TAIPEI).isoformat()}
+                    for r in sorted(t.reminders, key=lambda r: r.remind_at)
+                    if not r.sent
+                ],
+            }
+            for t in todos
+        ]
+
+    async def update_todo_status(self, todo_id: str, status: str) -> dict:
+        async with self._session_maker() as db:
+            todo = await crud.update_todo_status(db, uuid.UUID(todo_id), status)
+            if todo is None:
+                return {"status": "failed", "message": "Todo not found"}
+            await db.commit()
+        return {"status": "completed", "todo_id": todo_id, "content": todo.content}
+
+    async def snooze_todo(self, todo_id: str, days: int = 1) -> dict:
+        """Add one more reminder *days* from now (09:00 Asia/Taipei), on top
+        of whatever reminders already exist — doesn't touch or cancel them."""
+        todo_uuid = uuid.UUID(todo_id)
+        remind_date = datetime.now(_TAIPEI).date() + timedelta(days=days)
+        remind_at = datetime.combine(remind_date, time(hour=_TODO_REMINDER_HOUR, tzinfo=_TAIPEI))
+
+        async with self._session_maker() as db:
+            todo = await crud.get_todo(db, todo_uuid)
+            if todo is None:
+                return {"status": "failed", "message": "Todo not found"}
+            rows = await crud.create_todo_reminders(db, todo_uuid, [("snooze", remind_at)])
+            await db.commit()
+
+        for reminder in rows:
+            self._schedule_reminder(str(reminder.id), reminder.remind_at)
+
+        return {
+            "status": "completed",
+            "todo_id": todo_id,
+            "content": todo.content,
+            "remind_at": remind_at.isoformat(),
+        }
+
+    async def mark_todo_done_from_reminder(self, reminder_id: str) -> dict:
+        """Used by the Telegram reminder message's "✅ 完成" button — resolves
+        the reminder back to its parent todo, since the button only knows
+        the reminder it was attached to."""
+        async with self._session_maker() as db:
+            reminder = await crud.get_todo_reminder(db, uuid.UUID(reminder_id))
+        if reminder is None:
+            return {"status": "failed", "message": "Reminder not found"}
+        return await self.update_todo_status(str(reminder.todo_id), "done")
+
+    async def snooze_todo_from_reminder(self, reminder_id: str, days: int = 1) -> dict:
+        """Used by the Telegram reminder message's "😴 稍後提醒" button."""
+        async with self._session_maker() as db:
+            reminder = await crud.get_todo_reminder(db, uuid.UUID(reminder_id))
+        if reminder is None:
+            return {"status": "failed", "message": "Reminder not found"}
+        return await self.snooze_todo(str(reminder.todo_id), days=days)
+
+    async def _persist_todo(
+        self,
+        *,
+        content: str,
+        source: str,
+        raw_input: str | None,
+        start_date: date | None,
+        due_date: date | None,
+    ) -> dict:
+        reminders = self._compute_reminders(start_date, due_date)
+        source_url = self._extract_url(raw_input) if raw_input else None
+
+        async with self._session_maker() as db:
+            todo = await crud.create_todo(
+                db,
+                content=content,
+                source=source,
+                raw_input=raw_input,
+                source_url=source_url,
+                start_date=start_date,
+                due_date=due_date,
+            )
+            await db.flush()
+            todo_id = todo.id
+            created_at = todo.created_at
+            reminder_rows = await crud.create_todo_reminders(db, todo_id, reminders)
+            await db.commit()
+
+        for reminder in reminder_rows:
+            self._schedule_reminder(str(reminder.id), reminder.remind_at)
+
+        return {
+            "id": str(todo_id),
+            "todo_id": str(todo_id),
+            "content": content,
+            "status": "pending",
+            "source": source,
+            "source_url": source_url,
+            "start_date": start_date.isoformat() if start_date else None,
+            "due_date": due_date.isoformat() if due_date else None,
+            "reminders": [
+                {"label": r.label, "remind_at": r.remind_at.isoformat()} for r in reminder_rows
+            ],
+            "created_at": created_at,
+        }
+
+    @staticmethod
+    def _schedule_reminder(reminder_id: str, remind_at: datetime) -> None:
+        from backend.tasks.scheduler import get_scheduler, schedule_todo_reminder
+        schedule_todo_reminder(get_scheduler(), reminder_id, remind_at)
+
+    @staticmethod
+    def _parse_date(value: Any) -> date | None:
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _compute_reminders(
+        start_date: date | None, due_date: date | None
+    ) -> list[tuple[str, datetime]]:
+        """Build the reminder schedule for a todo — a rule-based set, not a
+        recurring/periodic nag:
+        - "start": on start_date, if given.
+        - "due": the day before due_date, if given.
+        - "midpoint": only when both dates are given AND the gap exceeds
+          _TODO_MIDPOINT_GAP_DAYS, so a long-running task isn't silent the
+          whole way through.
+        All fire at 09:00 Asia/Taipei. Duplicate dates collapse to one entry.
+        """
+        candidates: list[tuple[str, date]] = []
+        if start_date:
+            candidates.append(("start", start_date))
+        if due_date:
+            candidates.append(("due", due_date - timedelta(days=1)))
+        if start_date and due_date:
+            gap_days = (due_date - start_date).days
+            if gap_days > _TODO_MIDPOINT_GAP_DAYS:
+                midpoint = start_date + timedelta(days=gap_days // 2)
+                candidates.append(("midpoint", midpoint))
+
+        seen_dates: set[date] = set()
+        reminders: list[tuple[str, datetime]] = []
+        for label, d in candidates:
+            if d in seen_dates:
+                continue
+            seen_dates.add(d)
+            reminders.append(
+                (label, datetime.combine(d, time(hour=_TODO_REMINDER_HOUR, tzinfo=_TAIPEI)))
+            )
+        reminders.sort(key=lambda r: r[1])
+        return reminders
+
+    _URL_PATTERN = re.compile(r"https?://\S+")
+    _URL_TRAILING_PUNCT = ".,;:!?)]}、。，；：！？」』"
+
+    @classmethod
+    def _extract_url(cls, text: str) -> str | None:
+        match = cls._URL_PATTERN.search(text)
+        if not match:
+            return None
+        return match.group(0).rstrip(cls._URL_TRAILING_PUNCT)
 
     # ------------------------------------------------------------------
     # Routing

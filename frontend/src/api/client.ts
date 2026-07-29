@@ -8,12 +8,16 @@ import type {
   DocumentFilters,
   DocumentListResponse,
   MindmapResponse,
+  OcrEngineResponse,
   OllamaModelsResponse,
   Project,
   ActionItemListResponse,
   RetryResponse,
   SearchResponse,
   TestModelResponse,
+  DigestStatusResponse,
+  Todo,
+  TodoListResponse,
 } from "./types";
 
 class ApiError extends Error {
@@ -122,12 +126,49 @@ export const api = {
     return request(`/api/settings/trigger-digest`, { method: "POST" });
   },
 
+  getDigestStatus(): Promise<DigestStatusResponse> {
+    return request(`/api/settings/digest-status`);
+  },
+
+  getOcrEngine(): Promise<OcrEngineResponse> {
+    return request(`/api/settings/ocr-engine`);
+  },
+
+  updateOcrEngine(engine: string): Promise<OcrEngineResponse> {
+    return request(`/api/settings/ocr-engine`, {
+      method: "PATCH",
+      body: JSON.stringify({ engine }),
+    });
+  },
+
   listAgents(): Promise<Agent[]> {
     return request(`/api/agents/`);
   },
 
   toggleAgent(name: string): Promise<AgentToggleResponse> {
     return request(`/api/agents/${name}/toggle`, { method: "PATCH" });
+  },
+
+  createTodo(text: string, source = "dashboard"): Promise<Todo> {
+    return request(`/api/todos`, {
+      method: "POST",
+      body: JSON.stringify({ text, source }),
+    });
+  },
+
+  listTodos(params: { status?: string; due_before?: string } = {}): Promise<TodoListResponse> {
+    return request(`/api/todos${buildQuery(params)}`);
+  },
+
+  updateTodoStatus(todoId: string, status: string): Promise<{ status: string; todo_id: string }> {
+    return request(`/api/todos/${todoId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status }),
+    });
+  },
+
+  snoozeTodo(todoId: string): Promise<{ status: string; todo_id: string; remind_at: string }> {
+    return request(`/api/todos/${todoId}/snooze`, { method: "POST" });
   },
 };
 

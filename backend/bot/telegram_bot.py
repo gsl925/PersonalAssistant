@@ -26,8 +26,10 @@ from typing import Any
 
 from loguru import logger
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ParseMode
@@ -91,6 +93,10 @@ class PersonalAssistantBot:
 
         # Populated from the first inbound message; used by send_message().
         self._default_chat_id: int | None = None
+        # chat_ids that just tapped the "📌 新增代辦" quick-add button — their
+        # NEXT text message is treated as explicit todo content instead of
+        # going through the normal URL/query/ambient-detection routing.
+        self._awaiting_todo_chat_ids: set[int] = set()
 
         self._register_handlers()
         logger.info("PersonalAssistantBot initialised.")
@@ -105,6 +111,7 @@ class PersonalAssistantBot:
         # Commands
         add(CommandHandler("start", self.handle_start))
         add(CommandHandler("status", self.handle_status))
+        add(CommandHandler("todo", self.handle_todo_command))
 
         # Specific media types — registered before the broad TEXT filter.
         add(MessageHandler(filters.PHOTO, self.handle_photo))
@@ -124,6 +131,11 @@ class PersonalAssistantBot:
     # Command handlers
     # ------------------------------------------------------------------
 
+    # Persistent keyboard button — tapping it is a clear, no-typing way to say
+    # "I want to add a todo", as an alternative to remembering /todo or
+    # relying on the ambient date/keyword detection in handle_text().
+    _QUICK_TODO_BUTTON_TEXT = "📌 新增代辦"
+
     async def handle_start(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -137,9 +149,16 @@ class PersonalAssistantBot:
             "• 📄 文件 (PDF, DOCX…) — 文件摘要\n"
             "• 🎤 語音 / 錄音 — 會議轉錄\n"
             "• 🎬 影片 — 語音轉錄摘要\n\n"
+            f"點下方的「{self._QUICK_TODO_BUTTON_TEXT}」按鈕，或直接輸入 /todo 內容，"
+            "可以明確新增一筆代辦（不用等我猜）。\n\n"
             "使用 /status 查看目前狀態。"
         )
-        await update.message.reply_text(welcome, parse_mode=ParseMode.MARKDOWN)
+        keyboard = ReplyKeyboardMarkup(
+            [[self._QUICK_TODO_BUTTON_TEXT]], resize_keyboard=True
+        )
+        await update.message.reply_text(
+            welcome, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
 
     async def handle_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -152,6 +171,24 @@ class PersonalAssistantBot:
             "🤖 Bot 運作中 ✅"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+    async def handle_todo_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Explicit-intent todo creation via ``/todo <content>`` — skips the
+        ambient is-this-a-todo classification ``handle_text()`` uses for free
+        text, since intent is unambiguous here."""
+        self._cache_chat_id(update)
+        text = " ".join(context.args or []).strip()
+        if not text:
+            await update.message.reply_text("用法：/todo 內容，例如 /todo 記得繳電費 8/5 前")
+            return
+        try:
+            result = await self.orchestrator.create_todo_from_text(text, source="telegram")
+            await update.message.reply_text(self._format_todo_created(result))
+        except Exception as exc:
+            logger.exception("handle_todo_command error: {}", exc)
+            await update.message.reply_text(f"❌ 建立代辦時發生錯誤：{exc}")
 
     # ------------------------------------------------------------------
     # Media handlers
@@ -276,14 +313,35 @@ class PersonalAssistantBot:
         --------------
         - Starts with http:// or https:// → webclip-agent via input_type="url"
         - Looks like a todo/action-item query (e.g. "今天有沒有代辦事項") → answered
-          directly from the action-items aggregate, not saved as a note.
+          directly from the merged action-items + todos aggregate, not saved
+          as a note.
+        - Otherwise, ambiently checked for todo-creation intent (date-like
+          tokens or keywords) — see Orchestrator.maybe_create_todo_from_message.
         - Everything else (short notes, questions, long text) → input_type="text"
           and let the orchestrator's LLM routing decide the agent.
+
+        Two extra states take priority over all of the above: tapping the
+        "📌 新增代辦" quick-add button, and the message immediately following
+        that tap (treated as explicit todo content, bypassing classification
+        entirely — same as /todo).
         """
         self._cache_chat_id(update)
         text: str = update.message.text.strip()
+        chat_id = update.effective_chat.id if update.effective_chat else None
 
         try:
+            if text == self._QUICK_TODO_BUTTON_TEXT:
+                if chat_id is not None:
+                    self._awaiting_todo_chat_ids.add(chat_id)
+                await update.message.reply_text("📌 請輸入代辦內容（例如：8/5 前繳電費）")
+                return
+
+            if chat_id is not None and chat_id in self._awaiting_todo_chat_ids:
+                self._awaiting_todo_chat_ids.discard(chat_id)
+                result = await self.orchestrator.create_todo_from_text(text, source="telegram")
+                await update.message.reply_text(self._format_todo_created(result))
+                return
+
             if text.startswith("http://") or text.startswith("https://"):
                 await update.message.reply_text("🔗 連結已收到，正在處理...")
                 logger.info("Text classified as URL: {:.80}", text)
@@ -294,8 +352,19 @@ class PersonalAssistantBot:
 
             if self._TODO_INTENT_PATTERN.search(text):
                 logger.info("Text classified as todo-intent query: {:.60}", text)
-                items = await self.orchestrator.get_action_items()
-                await update.message.reply_text(self._format_action_items(items))
+                action_items = await self.orchestrator.get_action_items()
+                todos = await self.orchestrator.get_todos()
+                await update.message.reply_text(self._format_all_todos(action_items, todos))
+                return
+
+            todo_result = await self.orchestrator.maybe_create_todo_from_message(text)
+            if todo_result["status"] == "auto_created":
+                logger.info("Text ambiently classified as todo (auto): {:.60}", text)
+                await update.message.reply_text(self._format_todo_created(todo_result))
+                return
+            if todo_result["status"] == "pending_confirmation":
+                logger.info("Text ambiently classified as todo (needs confirm): {:.60}", text)
+                await self.send_todo_confirmation_request(todo_result, update)
                 return
 
             await update.message.reply_text("📝 訊息已收到，正在處理...")
@@ -318,10 +387,14 @@ class PersonalAssistantBot:
     ) -> None:
         """Handle inline button presses.
 
-        Two independent callback_data formats share this handler:
+        Four independent callback_data formats share this handler:
           - ``confirm:{doc_id}:{agent_name}``   — agent-routing confirmation
           - ``project:{doc_id}:{project_name}`` — project-assignment confirmation
             (``project_name`` may be the sentinel ``__skip__`` for "不歸類")
+          - ``todo:{confirmation_id}:{yes|no}`` — ambient todo-creation confirmation
+          - ``remind:{reminder_id}:{done|snooze}`` — action button on a fired
+            reminder message (works the same in the "待辦提醒" channel as in
+            a normal chat — any viewer can tap it, no admin rights needed)
         """
         query = update.callback_query
         await query.answer()
@@ -329,12 +402,51 @@ class PersonalAssistantBot:
         data: str = query.data or ""
         parts = data.split(":", 2)
 
-        if len(parts) != 3 or parts[0] not in ("confirm", "project"):
+        if len(parts) != 3 or parts[0] not in ("confirm", "project", "todo", "remind"):
             logger.warning("Unrecognised callback_data: {!r}", data)
             await query.edit_message_text("❓ 無效的操作。")
             return
 
         kind, doc_id, payload = parts
+
+        if kind == "remind":
+            logger.info("Reminder button pressed: reminder_id={} action={}", doc_id, payload)
+            try:
+                if payload == "done":
+                    result = await self.orchestrator.mark_todo_done_from_reminder(doc_id)
+                    if result.get("status") == "completed":
+                        await query.edit_message_text(f"✅ 已完成：{result['content']}")
+                    else:
+                        await query.edit_message_text(f"❌ {result.get('message', '發生錯誤')}")
+                elif payload == "snooze":
+                    result = await self.orchestrator.snooze_todo_from_reminder(doc_id)
+                    if result.get("status") == "completed":
+                        when = result["remind_at"][:16].replace("T", " ")
+                        await query.edit_message_text(f"😴 已延後，將於 {when} 再提醒：{result['content']}")
+                    else:
+                        await query.edit_message_text(f"❌ {result.get('message', '發生錯誤')}")
+                else:
+                    await query.edit_message_text("❓ 無效的操作。")
+            except Exception as exc:
+                logger.exception("handle_callback (remind) error: {}", exc)
+                await query.edit_message_text(f"❌ 處理時發生錯誤：{exc}")
+            return
+
+        if kind == "todo":
+            accept = payload == "yes"
+            logger.info("User responded to todo confirmation: confirmation_id={} accept={}", doc_id, accept)
+            try:
+                result = await self.orchestrator.confirm_todo(doc_id, accept)
+                if result.get("status") == "auto_created":
+                    await query.edit_message_text(self._format_todo_created(result))
+                elif result.get("status") == "cancelled":
+                    await query.edit_message_text("❌ 已取消建立代辦。")
+                else:
+                    await query.edit_message_text(f"❌ {result.get('message', '發生錯誤')}")
+            except Exception as exc:
+                logger.exception("handle_callback (todo) error: {}", exc)
+                await query.edit_message_text(f"❌ 確認時發生錯誤：{exc}")
+            return
 
         if kind == "confirm":
             logger.info("User confirmed routing: doc_id={} agent={}", doc_id, payload)
@@ -448,6 +560,29 @@ class PersonalAssistantBot:
             reply_markup=keyboard,
         )
 
+    async def send_todo_confirmation_request(
+        self,
+        todo_result: dict,
+        update: Update,
+    ) -> None:
+        """Ask the user to confirm a medium-confidence ambient todo detection.
+
+        Mirrors :meth:`send_project_confirmation_request` but for the
+        auto-vs-confirm decision made by
+        ``Orchestrator.maybe_create_todo_from_message``.
+        """
+        confirmation_id = todo_result["confirmation_id"]
+        content = todo_result["content"]
+        due_suffix = f"（截止 {todo_result['due_date']}）" if todo_result.get("due_date") else ""
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ 建立代辦", callback_data=f"todo:{confirmation_id}:yes"),
+            InlineKeyboardButton("❌ 不是", callback_data=f"todo:{confirmation_id}:no"),
+        ]])
+        await update.message.reply_text(
+            f"🤔 這是要建立代辦嗎？「{content}」{due_suffix}",
+            reply_markup=keyboard,
+        )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -456,6 +591,11 @@ class PersonalAssistantBot:
         """Start long polling on the caller's event loop (non-blocking)."""
         logger.info("Telegram bot starting long polling…")
         await self.app.initialize()
+        await self.app.bot.set_my_commands([
+            BotCommand("start", "顯示歡迎訊息"),
+            BotCommand("status", "查看系統狀態"),
+            BotCommand("todo", "新增一筆代辦，例如 /todo 記得繳電費 8/5 前"),
+        ])
         await self.app.start()
         await self.app.updater.start_polling(drop_pending_updates=True)
 
@@ -572,29 +712,60 @@ class PersonalAssistantBot:
         return "\n".join(lines)
 
     @staticmethod
-    def _format_action_items(items: list[dict]) -> str:
-        """Build a reply listing aggregated meeting action items.
-
-        There is no "done" flag in the data model, so this always lists
-        everything ever extracted — same caveat as the REST endpoint.
+    def _format_all_todos(action_items: list[dict], todos: list[dict]) -> str:
+        """Merge meeting-derived action_items with quick-capture todos into one
+        reply — both mean "代辦事項" to the user even though they live in
+        different tables with different capabilities (action_items has no
+        "done" flag; todos do).
         """
-        if not items:
-            return "📋 目前沒有偵測到任何代辦事項（尚無會議紀錄含 action items）。"
+        if not action_items and not todos:
+            return "📋 目前沒有代辦事項。"
 
-        items = sorted(items, key=lambda i: i.get("due_date") or "9999-99-99")
+        combined: list[dict] = []
+        for item in action_items:
+            combined.append({
+                "tag": "🗒",
+                "label": item["task"],
+                "due_date": item.get("due_date"),
+                "detail": f"來自：{item['source_title']}" if item.get("source_title") else None,
+            })
+        for todo in todos:
+            combined.append({
+                "tag": "📌",
+                "label": todo["content"],
+                "due_date": todo.get("due_date"),
+                "detail": None,
+            })
+        combined.sort(key=lambda i: i["due_date"] or "9999-99-99")
 
-        lines = [f"📋 代辦事項（共 {len(items)} 筆）："]
-        for item in items[:20]:
-            line = f"• {item['task']}"
-            if item.get("due_date"):
+        lines = [f"📋 代辦事項（共 {len(combined)} 筆）："]
+        for item in combined[:20]:
+            line = f"• {item['tag']} {item['label']}"
+            if item["due_date"]:
                 line += f"（📅 {item['due_date']}）"
-            if item.get("owner"):
-                line += f" @{item['owner']}"
-            if item.get("source_title"):
-                line += f"\n  來自：{item['source_title']}"
+            if item["detail"]:
+                line += f"\n  {item['detail']}"
             lines.append(line)
-        if len(items) > 20:
-            lines.append(f"...還有 {len(items) - 20} 筆，未列出")
+        if len(combined) > 20:
+            lines.append(f"...還有 {len(combined) - 20} 筆，未列出")
+        return "\n".join(lines)
+
+    _REMINDER_LABEL_ZH = {"start": "開始", "midpoint": "期間", "due": "截止前"}
+
+    @classmethod
+    def _format_todo_created(cls, result: dict) -> str:
+        """Build a reply showing the fields extracted for a newly created todo."""
+        lines = [f"📌 已記下代辦：{result['content']}"]
+        if result.get("start_date"):
+            lines.append(f"🗓️ 開始：{result['start_date']}")
+        if result.get("due_date"):
+            lines.append(f"⏰ 截止：{result['due_date']}")
+        if result.get("source_url"):
+            lines.append(f"🔗 {result['source_url']}")
+        for reminder in result.get("reminders") or []:
+            label = cls._REMINDER_LABEL_ZH.get(reminder["label"], reminder["label"])
+            when = reminder["remind_at"][:16].replace("T", " ")
+            lines.append(f"🔔 {label}提醒：{when}")
         return "\n".join(lines)
 
     def _cache_chat_id(self, update: Update) -> None:

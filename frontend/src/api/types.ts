@@ -105,6 +105,33 @@ export interface ActionItemListResponse {
   count: number;
 }
 
+// --- todos.py ---
+// Separate from ActionItem above: todos are quick-captured by the user
+// (Telegram/desktop/dashboard) and have a real status (pending/done/cancelled),
+// unlike meeting-derived action_items which have no "done" flag.
+
+export interface TodoReminder {
+  label: string; // start / midpoint / due
+  remind_at: string;
+}
+
+export interface Todo {
+  id: string;
+  content: string;
+  status: string;
+  start_date: string | null;
+  due_date: string | null;
+  source: string;
+  source_url: string | null;
+  created_at: string;
+  reminders?: TodoReminder[] | null;
+}
+
+export interface TodoListResponse {
+  items: Todo[];
+  count: number;
+}
+
 export interface RetryResponse {
   status: string;
   doc_id: string;
@@ -137,6 +164,16 @@ export interface OllamaModel {
 
 export interface OllamaModelsResponse {
   models: OllamaModel[];
+}
+
+export interface DigestStatusResponse {
+  last_sent_date: string | null;
+  today: string;
+  sent_today: boolean;
+}
+
+export interface OcrEngineResponse {
+  engine: string;
 }
 
 export interface TestModelResponse {

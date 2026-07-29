@@ -5,7 +5,8 @@ const LINKS = [
   { to: "/", label: "Project" },
   { to: "/timeline", label: "Timeline" },
   { to: "/mindmap", label: "Mindmap" },
-  { to: "/actions", label: "代辦事項" },
+  { to: "/actions", label: "會議代辦" },
+  { to: "/todos", label: "快速代辦" },
   { to: "/agents", label: "Agents" },
   { to: "/settings", label: "設定" },
 ];

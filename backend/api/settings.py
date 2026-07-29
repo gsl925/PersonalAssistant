@@ -54,6 +54,14 @@ class TestModelResponse(BaseModel):
     detail: str
 
 
+class OcrEngineResponse(BaseModel):
+    engine: str
+
+
+class OcrEnginePatchRequest(BaseModel):
+    engine: str
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -104,15 +112,62 @@ async def update_capability_tiers(
     return CapabilityTiersResponse(tiers=new_tiers)
 
 
+@router.get("/ocr-engine", response_model=OcrEngineResponse)
+async def get_ocr_engine() -> OcrEngineResponse:
+    """Return the currently active screenshot OCR engine ("tesseract" or "vlm")."""
+    return OcrEngineResponse(engine=settings.SCREENSHOT_OCR_ENGINE)
+
+
+@router.patch("/ocr-engine", response_model=OcrEngineResponse)
+async def update_ocr_engine(body: OcrEnginePatchRequest) -> OcrEngineResponse:
+    """Switch the screenshot OCR engine in-process (ephemeral, reverts on restart
+    unless also set in .env). "tesseract" is deterministic/local/no LLM call;
+    "vlm" uses the "ocr" capability tier (generative, still hallucinates on
+    dense text — kept switchable so newer VLM-OCR models can be re-tested)."""
+    if body.engine not in ("tesseract", "vlm"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="engine must be 'tesseract' or 'vlm'.",
+        )
+    settings.SCREENSHOT_OCR_ENGINE = body.engine
+    logger.info("Screenshot OCR engine switched to: {}", body.engine)
+    return OcrEngineResponse(engine=body.engine)
+
+
 @router.post("/trigger-digest", status_code=status.HTTP_202_ACCEPTED)
 async def trigger_digest() -> dict:
     """Manually run the daily digest job right now, instead of waiting for
-    the 08:00 Asia/Taipei APScheduler trigger."""
+    the 08:00 Asia/Taipei APScheduler trigger (or the once-a-day startup
+    catch-up). Passes force=True so a manual click always actually runs,
+    even if today's digest already went out."""
     from backend.tasks.processing import send_daily_digest
 
     logger.info("Daily digest manually triggered via API.")
-    await send_daily_digest()
-    return {"status": "triggered", "message": "Daily digest generated and sent."}
+    doc_count = await send_daily_digest(force=True)
+    message = (
+        "Daily digest generated and sent."
+        if doc_count
+        else "No documents today — sent a heads-up instead of a full digest."
+    )
+    return {"status": "triggered", "message": message}
+
+
+class DigestStatusResponse(BaseModel):
+    last_sent_date: str | None
+    today: str
+    sent_today: bool
+
+
+@router.get("/digest-status", response_model=DigestStatusResponse)
+async def digest_status() -> DigestStatusResponse:
+    """Surface whether today's digest has gone out yet — the cron trigger
+    only fires at 08:00 Asia/Taipei if the app happens to be running then,
+    but it's also caught up once on every app startup (see
+    backend/tasks/scheduler.py::start_scheduler), so this reflects whichever
+    happened first."""
+    from backend.tasks.processing import get_digest_status
+
+    return DigestStatusResponse(**get_digest_status())
 
 
 @router.get("/ollama-models", response_model=OllamaModelsResponse)

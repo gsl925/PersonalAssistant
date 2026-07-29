@@ -6,6 +6,7 @@ from pathlib import Path
 from loguru import logger
 
 from backend.adapters.base import BaseAdapter, ProcessedContent
+from backend.config import settings
 
 
 class ScreenshotAdapter(BaseAdapter):
@@ -35,12 +36,50 @@ class ScreenshotAdapter(BaseAdapter):
         if not image_path.exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
 
-        image_b64 = self._encode_image(image_path)
         saved = self._save_file(image_path)
 
+        if settings.SCREENSHOT_OCR_ENGINE == "tesseract":
+            response = await self._transcribe_with_tesseract(image_path)
+        else:
+            response = await self._transcribe_with_vlm(image_path)
+
+        return ProcessedContent(
+            source_type=self.source_type,
+            title=f"Screenshot: {image_path.stem}",
+            original_content=response,
+            file_path=str(saved),
+            metadata={"original_filename": image_path.name},
+        )
+
+    async def _transcribe_with_tesseract(self, image_path: Path) -> str:
+        """Deterministic local OCR — no LLM call, no hallucination risk, but
+        weaker at dense/small-text layout than a VLM (see project memory
+        2026-07-28 for the A/B comparison that motivated this engine)."""
+        import asyncio
+
+        import pytesseract
+        from PIL import Image
+
+        if settings.TESSERACT_CMD:
+            pytesseract.pytesseract.tesseract_cmd = settings.TESSERACT_CMD
+
+        def _run() -> str:
+            with Image.open(image_path) as img:
+                return pytesseract.image_to_string(img, lang=settings.TESSERACT_LANG)
+
         try:
-            response = await self.model_router.chat_with_image(
-                tier="vision",
+            text = await asyncio.to_thread(_run)
+        except Exception as exc:
+            logger.warning("Tesseract OCR failed, using fallback description: {}", exc)
+            return f"[Image file: {image_path.name}]"
+
+        return text.strip() or f"[Image file: {image_path.name}, no text detected]"
+
+    async def _transcribe_with_vlm(self, image_path: Path) -> str:
+        image_b64 = self._encode_image(image_path)
+        try:
+            return await self.model_router.chat_with_image(
+                tier="ocr",
                 messages=[
                     {"role": "system", "content": self._SYSTEM_PROMPT},
                     {
@@ -52,15 +91,7 @@ class ScreenshotAdapter(BaseAdapter):
             )
         except Exception as exc:
             logger.warning("VLM analysis failed, using fallback description: {}", exc)
-            response = f"[Image file: {image_path.name}]"
-
-        return ProcessedContent(
-            source_type=self.source_type,
-            title=f"Screenshot: {image_path.stem}",
-            original_content=response,
-            file_path=str(saved),
-            metadata={"original_filename": image_path.name},
-        )
+            return f"[Image file: {image_path.name}]"
 
     def _encode_image(self, path: Path) -> str:
         """Return the image as a base64-encoded string (JPEG or PNG)."""

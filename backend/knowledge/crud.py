@@ -14,6 +14,8 @@ from backend.knowledge.models import (
     DocumentRelation,
     DocumentTag,
     Project,
+    Todo,
+    TodoReminder,
 )
 
 
@@ -357,6 +359,108 @@ async def get_related_documents(
         .where(Document.id.in_(related_ids))
     )
     return result.scalars().all()
+
+
+# ---------------------------------------------------------------------------
+# Todos (quick-capture)
+# ---------------------------------------------------------------------------
+
+
+async def create_todo(
+    db: AsyncSession,
+    *,
+    content: str,
+    source: str,
+    raw_input: str | None = None,
+    source_url: str | None = None,
+    start_date: date | None = None,
+    due_date: date | None = None,
+) -> Todo:
+    todo = Todo(
+        id=uuid.uuid4(),
+        content=content,
+        source=source,
+        raw_input=raw_input,
+        source_url=source_url,
+        start_date=start_date,
+        due_date=due_date,
+    )
+    db.add(todo)
+    await db.flush()
+    return todo
+
+
+async def create_todo_reminders(
+    db: AsyncSession, todo_id: uuid.UUID, reminders: list[tuple[str, datetime]]
+) -> list[TodoReminder]:
+    """reminders is a list of (label, remind_at) pairs, e.g. [("start", ...), ("due", ...)]."""
+    rows = [
+        TodoReminder(id=uuid.uuid4(), todo_id=todo_id, label=label, remind_at=remind_at)
+        for label, remind_at in reminders
+    ]
+    if rows:
+        db.add_all(rows)
+        await db.flush()
+    return rows
+
+
+async def get_todo(db: AsyncSession, todo_id: uuid.UUID) -> Todo | None:
+    return await db.get(Todo, todo_id)
+
+
+async def list_todos(
+    db: AsyncSession,
+    status: str | None = None,
+    due_before: date | None = None,
+) -> Sequence[Todo]:
+    q = select(Todo).options(selectinload(Todo.reminders))
+    filters = []
+    if status:
+        filters.append(Todo.status == status)
+    if due_before is not None:
+        filters.append(Todo.due_date.isnot(None))
+        filters.append(Todo.due_date <= due_before)
+    if filters:
+        q = q.where(and_(*filters))
+    q = q.order_by(Todo.due_date.asc().nulls_last(), Todo.created_at.desc())
+    result = await db.execute(q)
+    return result.scalars().all()
+
+
+async def update_todo_status(
+    db: AsyncSession, todo_id: uuid.UUID, status: str
+) -> Todo | None:
+    todo = await db.get(Todo, todo_id)
+    if todo is None:
+        return None
+    todo.status = status
+    todo.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    return todo
+
+
+async def list_pending_todo_reminders(db: AsyncSession) -> Sequence[TodoReminder]:
+    """Unsent reminders belonging to still-pending todos — used to re-register
+    APScheduler jobs on startup, since the in-memory job store loses
+    everything on restart."""
+    result = await db.execute(
+        select(TodoReminder)
+        .join(Todo, Todo.id == TodoReminder.todo_id)
+        .where(TodoReminder.sent.is_(False))
+        .where(Todo.status == "pending")
+    )
+    return result.scalars().all()
+
+
+async def get_todo_reminder(db: AsyncSession, reminder_id: uuid.UUID) -> TodoReminder | None:
+    return await db.get(TodoReminder, reminder_id)
+
+
+async def mark_todo_reminder_sent(db: AsyncSession, reminder_id: uuid.UUID) -> None:
+    reminder = await db.get(TodoReminder, reminder_id)
+    if reminder is not None:
+        reminder.sent = True
+        await db.flush()
 
 
 async def get_mindmap_data(

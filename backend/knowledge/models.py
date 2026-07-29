@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -208,6 +209,72 @@ class DocumentRelation(Base):
     __table_args__ = (
         Index("ix_document_relations_doc_id_b", "doc_id_b"),
         Index("ix_document_relations_relation_type", "relation_type"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Todo  (quick-capture todo/reminder — separate from meeting action_items,
+# which have no "done" flag and come from a different source)
+# ---------------------------------------------------------------------------
+
+
+class Todo(Base):
+    __tablename__ = "todos"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(
+        String(20), nullable=False
+    )  # telegram / desktop / dashboard
+    raw_input: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Cheap regex-extracted URL from raw_input, if any — just a reference
+    # link, not fetched/summarized (that's webclip's job, not this table's).
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", index=True
+    )  # pending / done / cancelled
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, onupdate=_utcnow
+    )
+
+    reminders: Mapped[list[TodoReminder]] = relationship(
+        "TodoReminder", back_populates="todo", cascade="all, delete-orphan"
+    )
+
+
+# ---------------------------------------------------------------------------
+# TodoReminder  (one-to-many: a Todo can have a start/midpoint/due reminder)
+# ---------------------------------------------------------------------------
+
+
+class TodoReminder(Base):
+    __tablename__ = "todo_reminders"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    todo_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("todos.id", ondelete="CASCADE"), nullable=False
+    )
+    remind_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    label: Mapped[str] = mapped_column(String(20), nullable=False)  # start / midpoint / due
+    sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    todo: Mapped[Todo] = relationship("Todo", back_populates="reminders")
+
+    __table_args__ = (
+        Index("ix_todo_reminders_remind_at", "remind_at"),
+        Index("ix_todo_reminders_todo_id", "todo_id"),
     )
 
 

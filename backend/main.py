@@ -182,11 +182,13 @@ def create_app() -> FastAPI:
     from backend.api.ingest import router as ingest_router
     from backend.api.knowledge import router as knowledge_router
     from backend.api.settings import router as settings_router
+    from backend.api.todos import router as todos_router
 
     app.include_router(ingest_router)
     app.include_router(knowledge_router)
     app.include_router(agents_router)
     app.include_router(settings_router)
+    app.include_router(todos_router)
 
     # ------------------------------------------------------------------
     # Static files — dashboard served at /dashboard

@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
-import type { CapabilityTiers, OllamaModel } from "../api/types";
+import type { CapabilityTiers, DigestStatusResponse, OllamaModel } from "../api/types";
+
+const OCR_ENGINES: { value: string; label: string }[] = [
+  { value: "tesseract", label: "Tesseract（本地、確定性、無 LLM 呼叫）" },
+  { value: "vlm", label: "VLM（生成式，密集文字仍可能幻覺）" },
+];
 
 const PROVIDERS = ["ollama_local", "ollama_cloud"];
 
@@ -12,6 +17,13 @@ export default function SettingsView() {
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, string>>({});
   const [digestMsg, setDigestMsg] = useState<string | null>(null);
+  const [digestStatus, setDigestStatus] = useState<DigestStatusResponse | null>(null);
+  const [ocrEngine, setOcrEngine] = useState<string>("tesseract");
+  const [ocrMsg, setOcrMsg] = useState<string | null>(null);
+
+  function loadDigestStatus() {
+    api.getDigestStatus().then(setDigestStatus).catch(() => setDigestStatus(null));
+  }
 
   useEffect(() => {
     Promise.all([api.getCapabilityTiers(), api.getOllamaModels().catch(() => ({ models: [] }))]).then(
@@ -21,7 +33,20 @@ export default function SettingsView() {
         setLoading(false);
       }
     );
+    loadDigestStatus();
+    api.getOcrEngine().then((res) => setOcrEngine(res.engine)).catch(() => {});
   }, []);
+
+  async function changeOcrEngine(engine: string) {
+    setOcrMsg("切換中…");
+    try {
+      const res = await api.updateOcrEngine(engine);
+      setOcrEngine(res.engine);
+      setOcrMsg("已切換（僅在記憶體中生效，重啟後會還原成 .env 設定）");
+    } catch (e) {
+      setOcrMsg("切換失敗：" + (e as Error).message);
+    }
+  }
 
   function updateEntry(tier: string, idx: number, field: "provider" | "model", value: string) {
     setTiers((t) => {
@@ -71,6 +96,8 @@ export default function SettingsView() {
       setDigestMsg(res.message);
     } catch (e) {
       setDigestMsg("失敗：" + (e as Error).message);
+    } finally {
+      loadDigestStatus();
     }
   }
 
@@ -80,8 +107,35 @@ export default function SettingsView() {
     <div>
       <div className="card" style={{ marginBottom: 20 }}>
         <h3 style={{ marginTop: 0, fontSize: 14 }}>每日彙整</h3>
+        <p className="muted" style={{ fontSize: 12 }}>
+          不是固定 08:00 觸發才算——後端每次啟動時，只要當天還沒發過就會自動補發一次，
+          比較適合不是隨時開機的機器。
+        </p>
+        {digestStatus && (
+          <p className="muted" style={{ fontSize: 12 }}>
+            {digestStatus.sent_today
+              ? `✅ 今天 (${digestStatus.today}) 已發送`
+              : `⏳ 今天 (${digestStatus.today}) 還沒發送`}
+            {digestStatus.last_sent_date && ` · 最近一次：${digestStatus.last_sent_date}`}
+          </p>
+        )}
         <button onClick={triggerDigest}>立即觸發每日摘要</button>
         {digestMsg && <p className="muted" style={{ fontSize: 12 }}>{digestMsg}</p>}
+      </div>
+
+      <div className="card" style={{ marginBottom: 20 }}>
+        <h3 style={{ marginTop: 0, fontSize: 14 }}>截圖 OCR 引擎</h3>
+        <p className="muted" style={{ fontSize: 12 }}>
+          Tesseract 較穩定不易幻覺，但排版理解較弱；VLM 較會理解版面但密集文字仍可能編造內容。
+        </p>
+        <select value={ocrEngine} onChange={(e) => changeOcrEngine(e.target.value)}>
+          {OCR_ENGINES.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+        {ocrMsg && <p className="muted" style={{ fontSize: 12 }}>{ocrMsg}</p>}
       </div>
 
       <h3 style={{ fontSize: 14 }}>Capability Tiers</h3>

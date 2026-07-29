@@ -42,4 +42,16 @@ async function ingestFilePath(filePath, inputType) {
   return parseOrThrow(res);
 }
 
-module.exports = { ingestText, ingestUrl, ingestFilePath, BASE_URL };
+async function createTodo(text) {
+  // Explicit-intent path — the backend skips the ambient is-this-a-todo
+  // classification the Telegram bot uses, since pressing this hotkey already
+  // says "this is a todo".
+  const res = await fetch(`${BASE_URL}/api/todos`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, source: "desktop" }),
+  });
+  return parseOrThrow(res);
+}
+
+module.exports = { ingestText, ingestUrl, ingestFilePath, createTodo, BASE_URL };

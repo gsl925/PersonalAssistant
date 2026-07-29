@@ -4,6 +4,7 @@ import ProjectView from "./components/ProjectView";
 import TimelineView from "./components/TimelineView";
 import MindmapView from "./components/MindmapView";
 import ActionItemsPanel from "./components/ActionItemsPanel";
+import TodosView from "./components/TodosView";
 import SettingsView from "./components/SettingsView";
 import AgentsView from "./components/AgentsView";
 
@@ -15,6 +16,7 @@ export default function App() {
         <Route path="timeline" element={<TimelineView />} />
         <Route path="mindmap" element={<MindmapView />} />
         <Route path="actions" element={<ActionItemsPanel />} />
+        <Route path="todos" element={<TodosView />} />
         <Route path="agents" element={<AgentsView />} />
         <Route path="settings" element={<SettingsView />} />
       </Route>
