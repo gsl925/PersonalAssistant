@@ -226,8 +226,8 @@ class Todo(Base):
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str] = mapped_column(
-        String(20), nullable=False
-    )  # telegram / desktop / dashboard
+        String(50), nullable=False
+    )  # telegram / desktop / dashboard / claude:{project_name}
     raw_input: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Cheap regex-extracted URL from raw_input, if any — just a reference
     # link, not fetched/summarized (that's webclip's job, not this table's).

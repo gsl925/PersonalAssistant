@@ -412,6 +412,7 @@ async def list_todos(
     db: AsyncSession,
     status: str | None = None,
     due_before: date | None = None,
+    source: str | None = None,
 ) -> Sequence[Todo]:
     q = select(Todo).options(selectinload(Todo.reminders))
     filters = []
@@ -420,11 +421,31 @@ async def list_todos(
     if due_before is not None:
         filters.append(Todo.due_date.isnot(None))
         filters.append(Todo.due_date <= due_before)
+    if source:
+        filters.append(Todo.source == source)
     if filters:
         q = q.where(and_(*filters))
     q = q.order_by(Todo.due_date.asc().nulls_last(), Todo.created_at.desc())
     result = await db.execute(q)
     return result.scalars().all()
+
+
+async def find_todo_created_today(
+    db: AsyncSession, source: str, content: str, today: date
+) -> Todo | None:
+    """Dedup check for synced project check-in todos — same source, same
+    content, created on *today* (caller-computed, e.g. Asia/Taipei date, to
+    avoid UTC/local day-boundary mismatches)."""
+    result = await db.execute(
+        select(Todo).where(
+            and_(
+                Todo.source == source,
+                Todo.content == content,
+                func.date(Todo.created_at) == today,
+            )
+        )
+    )
+    return result.scalar_one_or_none()
 
 
 async def update_todo_status(

@@ -5,11 +5,13 @@ The scheduler is started/stopped inside the FastAPI lifespan context.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
 # Module-level singleton created on first call to get_scheduler()
@@ -29,6 +31,7 @@ def setup_jobs(scheduler: AsyncIOScheduler) -> None:
     Called once during FastAPI lifespan startup, before scheduler.start().
     """
     from backend.tasks.processing import send_daily_digest
+    from backend.tasks.project_sync import sync_all_projects
 
     # Daily digest at 08:00 Asia/Taipei
     scheduler.add_job(
@@ -40,6 +43,19 @@ def setup_jobs(scheduler: AsyncIOScheduler) -> None:
         misfire_grace_time=3600,  # run if missed within 1 hour
     )
     logger.info("Scheduled: daily digest at 08:00 Asia/Taipei")
+
+    # Cross-project PROGRESS.md sync — polls every 30 min rather than once a
+    # day, since the user wants to actually notice a "💬 待溝通/建議" item
+    # soon after a project writes it, not the next morning.
+    scheduler.add_job(
+        sync_all_projects,
+        trigger=IntervalTrigger(minutes=30),
+        id="project_progress_sync",
+        name="Cross-project PROGRESS.md sync",
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+    logger.info("Scheduled: cross-project PROGRESS.md sync every 30 minutes")
 
 
 def schedule_todo_reminder(scheduler: AsyncIOScheduler, reminder_id: str, remind_at: datetime) -> None:
@@ -84,6 +100,7 @@ async def _reschedule_pending_todo_reminders(scheduler: AsyncIOScheduler) -> Non
 async def start_scheduler() -> AsyncIOScheduler:
     """Configure and start the scheduler. Returns the running scheduler."""
     from backend.tasks.processing import send_daily_digest
+    from backend.tasks.project_sync import sync_all_projects
 
     scheduler = get_scheduler()
     setup_jobs(scheduler)
@@ -96,6 +113,17 @@ async def start_scheduler() -> AsyncIOScheduler:
     # send_daily_digest() itself guards on "already sent today" so this is
     # a safe no-op on days the cron already handled it.
     await send_daily_digest()
+
+    # Run the project sync once immediately too — otherwise a fresh restart
+    # would wait up to 30 minutes for the interval trigger's first fire.
+    # NOT awaited: this is plain file I/O so it's fast, but there's no
+    # reason to make startup wait on it either.
+    sync_task = asyncio.create_task(sync_all_projects())
+    sync_task.add_done_callback(
+        lambda t: t.exception() and logger.error(
+            "Background project sync task failed: {}", t.exception()
+        )
+    )
     return scheduler
 
 

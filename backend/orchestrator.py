@@ -629,6 +629,33 @@ class Orchestrator:
             for t in todos
         ]
 
+    async def sync_project_todos(self, project_name: str, pending_items: list[dict]) -> int:
+        """Create todos from a daily project check-in's pending_items,
+        skipping ones already synced today (same source+content) so re-runs
+        and repeated still-unresolved items don't pile up duplicate rows.
+        Returns the number of todos actually created."""
+        source = f"claude:{project_name}"
+        today = datetime.now(_TAIPEI).date()
+        created = 0
+        for item in pending_items:
+            content = item.get("content")
+            if not content:
+                continue
+            async with self._session_maker() as db:
+                existing = await crud.find_todo_created_today(db, source, content, today)
+            if existing is not None:
+                continue
+            due_date = self._parse_date(item.get("due_date"))
+            await self._persist_todo(
+                content=content,
+                source=source,
+                raw_input=None,
+                start_date=None,
+                due_date=due_date,
+            )
+            created += 1
+        return created
+
     async def update_todo_status(self, todo_id: str, status: str) -> dict:
         async with self._session_maker() as db:
             todo = await crud.update_todo_status(db, uuid.UUID(todo_id), status)

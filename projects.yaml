@@ -1,0 +1,17 @@
+projects:
+  - name: genai-news
+    label: "GenAI News"
+    repo_path: "D:/_SideProject/GenAI_News"
+    enabled: true
+  - name: personal-assistant
+    label: "Personal Assistant"
+    repo_path: "D:/_SideProject/PersonalContent_Assistant"
+    enabled: true
+  - name: aegis-trader
+    label: "AegisTrader"
+    repo_path: "D:/_SideProject/AegisTrader"
+    enabled: true
+  - name: investment
+    label: "Investment"
+    repo_path: "D:/_SideProject/Investment"
+    enabled: true

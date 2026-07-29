@@ -25,6 +25,9 @@ secrets.*
 # === Claude Code 本機設定（含個人權限清單，可能含機敏指令字串）===
 .claude/
 
+# === 跨專案進度同步狀態（見 SDD_PROGRESS_SYNC.md，PA 跟本機常駐 checkbox 狀態，不進版控）===
+PROGRESS.md
+
 # === Python 編譯檔 ===
 __pycache__/
 *.py[cod]

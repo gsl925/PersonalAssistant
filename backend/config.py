@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field, model_validator
+import yaml
+from loguru import logger
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -126,6 +128,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     SKILLS_DIR: Path = Path()   # populated by validator below
     UPLOADS_DIR: Path = Path()  # populated by validator below
+    PROJECTS_YAML_PATH: Path = Path()  # populated by validator below
 
     @model_validator(mode="after")
     def build_derived_paths(self) -> "Settings":
@@ -134,6 +137,8 @@ class Settings(BaseSettings):
             self.SKILLS_DIR = self.BASE_DIR / "skills"
         if self.UPLOADS_DIR == Path():
             self.UPLOADS_DIR = self.BASE_DIR / "data" / "uploads"
+        if self.PROJECTS_YAML_PATH == Path():
+            self.PROJECTS_YAML_PATH = self.BASE_DIR / "projects.yaml"
         return self
 
     # ------------------------------------------------------------------
@@ -162,3 +167,34 @@ class Settings(BaseSettings):
 # ---------------------------------------------------------------------------
 
 settings = Settings()
+
+
+# ---------------------------------------------------------------------------
+# Tracked projects (daily cross-project check-in — see
+# DESIGN_每日跨專案進度確認機制.md)
+# ---------------------------------------------------------------------------
+
+class TrackedProject(BaseModel):
+    name: str
+    label: str
+    repo_path: str
+    enabled: bool = True
+
+
+def load_tracked_projects() -> list[TrackedProject]:
+    """Read projects.yaml fresh on every call (cheap — a handful of entries)
+    so the list can be edited without restarting the backend. Returns only
+    enabled projects; missing file or malformed entries log a warning and
+    yield an empty list rather than raising, since the daily check-in job
+    calling this must never crash the whole app over a config typo."""
+    path = settings.PROJECTS_YAML_PATH
+    if not path.exists():
+        logger.warning("projects.yaml not found at {}; no projects tracked.", path)
+        return []
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        projects = [TrackedProject(**entry) for entry in data.get("projects", [])]
+    except Exception as exc:
+        logger.error("Failed to parse {}: {}", path, exc)
+        return []
+    return [p for p in projects if p.enabled]

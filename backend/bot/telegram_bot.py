@@ -303,6 +303,11 @@ class PersonalAssistantBot:
     # ------------------------------------------------------------------
 
     _TODO_INTENT_PATTERN = re.compile(r"代辦|待辦|todo|to-do|action[\s-]?items?", re.IGNORECASE)
+    # Matches the "#project-slug" hashtag the daily cross-project check-in
+    # report tags each message with (see claude_checkin.py) — a reply
+    # containing it is the user's go-ahead to actually execute for that
+    # project. See DESIGN_每日跨專案進度確認機制.md §3.4.
+    _PROJECT_HASHTAG_PATTERN = re.compile(r"#([a-z0-9\-]+)")
 
     async def handle_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -341,6 +346,31 @@ class PersonalAssistantBot:
                 result = await self.orchestrator.create_todo_from_text(text, source="telegram")
                 await update.message.reply_text(self._format_todo_created(result))
                 return
+
+            hashtag_match = self._PROJECT_HASHTAG_PATTERN.search(text)
+            if hashtag_match:
+                from backend.config import load_tracked_projects
+                from backend.tasks.project_sync import write_instruction
+
+                project_name = hashtag_match.group(1)
+                project = next(
+                    (p for p in load_tracked_projects() if p.name == project_name), None
+                )
+                if project is not None:
+                    # PA never executes anything itself — this just relays
+                    # the reply into that project's PROGRESS.md ("📮 你的指示");
+                    # the project's own Claude Code session picks it up from
+                    # there (see SDD_PROGRESS_SYNC.md). Plain file write, so
+                    # no background task/timeout handling needed.
+                    ok = await write_instruction(project_name, text)
+                    if ok:
+                        await update.message.reply_text(f"✅ 已記錄，會轉達給「{project.label}」")
+                    else:
+                        await update.message.reply_text(
+                            f"❌ 「{project.label}」還沒有 PROGRESS.md，無法轉達。"
+                        )
+                    return
+                # Unrecognised hashtag — fall through to normal classification.
 
             if text.startswith("http://") or text.startswith("https://"):
                 await update.message.reply_text("🔗 連結已收到，正在處理...")
