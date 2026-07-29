@@ -22,6 +22,11 @@ from backend.tasks.processing import _send_telegram
 _TAIPEI = ZoneInfo("Asia/Taipei")
 
 PROGRESS_FILENAME = "PROGRESS.md"
+# Permanent, git-tracked record of resolved 💬/📮 exchanges — unlike
+# PROGRESS.md (live, gitignored, constantly overwritten), this only ever
+# grows, one entry per resolved decision, so the project keeps a durable
+# log of what was discussed and decided even after PROGRESS.md moves on.
+HISTORY_FILENAME = "PROGRESS_HISTORY.md"
 
 _REPORT_HEADER = "## 📋 進度回報"
 _DISCUSS_HEADER = "## 💬 待溝通 / 建議"
@@ -35,10 +40,28 @@ _ESCALATE_AFTER_CYCLES = 4  # ~2 hours at the 30-minute poll interval
 
 _BULLET_PATTERN = re.compile(r"^- \[( |x)\] (.*)$")
 _UPDATED_AT_PATTERN = re.compile(r"- 更新時間:[ \t]*(.*)")
+# A reply that starts with a number targets that specific 💬 item (see the
+# "#N 需要你決定" tag on each relayed message) — e.g. "1. 好，加進去" or "1 好".
+_REPLY_NUMBER_PATTERN = re.compile(r"^\s*#?(\d+)[.:、\s]+(.*)$", re.DOTALL)
 
 
 def _progress_path(project: TrackedProject) -> Path:
     return Path(project.repo_path) / PROGRESS_FILENAME
+
+
+def _history_path(project: TrackedProject) -> Path:
+    return Path(project.repo_path) / HISTORY_FILENAME
+
+
+def _append_history(project: TrackedProject, discuss_content: str, decision_text: str) -> None:
+    path = _history_path(project)
+    today = datetime.now(_TAIPEI).date().isoformat()
+    entry = f"## {today} — {project.label}\n- **待溝通**：{discuss_content}\n- **決策**：{decision_text}\n\n"
+    if not path.exists():
+        path.write_text(f"# {project.label} 進度同步歷史紀錄\n\n{entry}", encoding="utf-8")
+    else:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(entry)
 
 
 async def _send_relay(text: str) -> None:
@@ -110,31 +133,41 @@ def _write_state(state: dict) -> None:
 
 
 def _project_state(state: dict, project_name: str) -> dict:
-    return state.setdefault(
-        project_name, {"cycle": 0, "last_report_time": None, "awaiting_decision": []}
-    )
+    pstate = state.setdefault(project_name, {})
+    pstate.setdefault("cycle", 0)
+    pstate.setdefault("last_report_time", None)
+    pstate.setdefault("awaiting_decision", [])
+    pstate.setdefault("next_item_number", 1)
+    return pstate
 
 
-async def _relay_discuss_items(project: TrackedProject, full_text: str, pstate: dict) -> str:
-    """Relay unchecked "💬 待溝通/建議" bullets to Telegram, check them off in
-    the file (checked = "PA has relayed it", not "user decided"), and start
-    tracking them in pstate for the escalate-to-todo check."""
+async def _relay_discuss_items(project: TrackedProject, full_text: str, pstate: dict) -> None:
+    """Send Telegram for any not-yet-relayed unchecked "💬" bullet, tagged
+    with a stable #N so a later reply can target it precisely (see
+    write_instruction) — without a number, one reply would ambiguously
+    resolve every open item for the project at once. Does NOT check the box
+    itself — the checkbox only flips once write_instruction actually
+    resolves that specific item. Re-relay is prevented via
+    pstate['awaiting_decision'] tracking, not via the file, so an
+    already-relayed, still-unresolved item quietly stays `[ ]` without being
+    re-sent to Telegram every cycle."""
     sections = _split_sections(full_text)
-    instruct_count = len(_extract_bullets(sections[_INSTRUCT_HEADER]))
+    already_tracked = {item["content"] for item in pstate["awaiting_decision"]}
     for bullet in _extract_bullets(sections[_DISCUSS_HEADER]):
-        if bullet["checked"]:
+        if bullet["checked"] or bullet["content"] in already_tracked:
             continue
-        await _send_relay(f"💬 [{project.label}] 需要你決定：{bullet['content']}\n\n#{project.name}")
-        checked_line = bullet["raw_line"].replace("- [ ]", "- [x]", 1)
-        full_text = full_text.replace(bullet["raw_line"], checked_line, 1)
+        number = pstate["next_item_number"]
+        pstate["next_item_number"] = number + 1
+        await _send_relay(f"💬 [{project.label}] #{number} 需要你決定：{bullet['content']}\n\n#{project.name}")
         pstate["awaiting_decision"].append(
             {
+                "number": number,
                 "content": bullet["content"],
+                "raw_line": bullet["raw_line"],
                 "relayed_at_cycle": pstate["cycle"],
-                "instruct_count_at_relay": instruct_count,
+                "escalated": False,
             }
         )
-    return full_text
 
 
 async def _maybe_relay_report(project: TrackedProject, full_text: str, pstate: dict) -> None:
@@ -148,42 +181,41 @@ async def _maybe_relay_report(project: TrackedProject, full_text: str, pstate: d
     pstate["last_report_time"] = updated_at
 
 
-async def _escalate_stale_discuss_items(project: TrackedProject, full_text: str, pstate: dict) -> None:
-    """An awaiting_decision item survives _ESCALATE_AFTER_CYCLES cycles with
-    no new "📮 你的指示" entry appearing → treat as undecided, create a
-    Dashboard todo as a fallback reminder. If new instructions *did* show up
-    since the item was relayed, assume the user handled it via those and
-    just drop it — no per-item content matching, good enough at this scale.
+async def _escalate_stale_discuss_items(project: TrackedProject, pstate: dict) -> None:
+    """Once an item has sat unresolved for _ESCALATE_AFTER_CYCLES cycles,
+    escalate it into a Dashboard todo *once* as a fallback reminder — but
+    keep tracking it (don't touch the file), so a late reply via
+    write_instruction still resolves and checks it off normally; escalation
+    just means "also remind me on the Dashboard," not "give up on this."
     """
-    instruct_count = len(_extract_bullets(_split_sections(full_text)[_INSTRUCT_HEADER]))
-    still_awaiting = []
-    to_escalate = []
-    for item in pstate["awaiting_decision"]:
-        age = pstate["cycle"] - item["relayed_at_cycle"]
-        if age < _ESCALATE_AFTER_CYCLES:
-            still_awaiting.append(item)
-        elif instruct_count > item.get("instruct_count_at_relay", 0):
-            pass  # new instruction appeared since relay — assume it's handled
-        else:
-            to_escalate.append(item)
+    to_escalate = [
+        item
+        for item in pstate["awaiting_decision"]
+        if not item["escalated"] and pstate["cycle"] - item["relayed_at_cycle"] >= _ESCALATE_AFTER_CYCLES
+    ]
+    if not to_escalate:
+        return
+    for item in to_escalate:
+        item["escalated"] = True
 
-    if to_escalate:
-        try:
-            from backend.main import get_orchestrator
+    try:
+        from backend.main import get_orchestrator
 
-            orchestrator = get_orchestrator()
-            pending_items = [{"content": item["content"], "due_date": None} for item in to_escalate]
-            created = await orchestrator.sync_project_todos(project.name, pending_items)
-            if created:
-                logger.info("Escalated {} unresolved item(s) from {} to a todo.", created, project.name)
-        except Exception as exc:
-            # Don't lose track of these — retry escalating them next cycle
-            # instead of silently dropping them because e.g. the orchestrator
-            # wasn't ready.
-            logger.error("Failed to escalate stale item(s) for {}: {}", project.name, exc)
-            still_awaiting.extend(to_escalate)
-
-    pstate["awaiting_decision"] = still_awaiting
+        orchestrator = get_orchestrator()
+        pending_items = [
+            {"content": f"[{project.label}] {item['content']}", "due_date": None}
+            for item in to_escalate
+        ]
+        created = await orchestrator.sync_project_todos(project.name, pending_items)
+        if created:
+            logger.info("Escalated {} unresolved item(s) from {} to a todo.", created, project.name)
+    except Exception as exc:
+        # Don't lose track of these — retry escalating them next cycle
+        # instead of silently dropping them because e.g. the orchestrator
+        # wasn't ready.
+        logger.error("Failed to escalate stale item(s) for {}: {}", project.name, exc)
+        for item in to_escalate:
+            item["escalated"] = False
 
 
 async def write_instruction(project_name: str, text: str) -> bool:
@@ -194,7 +226,15 @@ async def write_instruction(project_name: str, text: str) -> bool:
     "📮 你的指示" is always the LAST section in the fixed template (see
     SDD_PROGRESS_SYNC.md) and the project side is only supposed to check its
     boxes, never add prose after it — so appending to end-of-file is safe
-    and avoids a fragile reconstruct-the-whole-file edit."""
+    and avoids a fragile reconstruct-the-whole-file edit.
+
+    If *text* starts with a number (e.g. "1. 好，加進去"), it's resolving that
+    specific "#N" 💬 item relayed earlier — checks that item's box for real
+    and archives the Q&A pair into PROGRESS_HISTORY.md. Without a number,
+    it's only auto-resolved if there's exactly one open item (unambiguous);
+    otherwise nothing gets checked off — better to leave it open than
+    silently resolve the wrong one.
+    """
     project = next((p for p in load_tracked_projects() if p.name == project_name), None)
     if project is None:
         return False
@@ -208,10 +248,41 @@ async def write_instruction(project_name: str, text: str) -> bool:
         logger.warning("write_instruction: {} missing '{}' section.", project_name, _INSTRUCT_HEADER)
         return False
 
+    state = _read_state()
+    pstate = _project_state(state, project_name)
+
+    number_match = _REPLY_NUMBER_PATTERN.match(text)
+    target_item = None
+    instruction_text = text
+    if number_match:
+        number = int(number_match.group(1))
+        instruction_text = number_match.group(2).strip() or text
+        target_item = next(
+            (i for i in pstate["awaiting_decision"] if i["number"] == number), None
+        )
+    elif len(pstate["awaiting_decision"]) == 1:
+        target_item = pstate["awaiting_decision"][0]
+
     today = datetime.now(_TAIPEI).date().isoformat()
-    new_line = f"- [ ] {today} {text}"
+    new_line = f"- [ ] {today} {instruction_text}"
     full_text = full_text.rstrip("\n") + "\n" + new_line + "\n"
+
+    if target_item is not None:
+        checked_line = target_item["raw_line"].replace("- [ ]", "- [x]", 1)
+        full_text = full_text.replace(target_item["raw_line"], checked_line, 1)
+        pstate["awaiting_decision"].remove(target_item)
+        _append_history(project, target_item["content"], instruction_text)
+        if target_item["escalated"]:
+            try:
+                from backend.main import get_orchestrator
+
+                todo_content = f"[{project.label}] {target_item['content']}"
+                await get_orchestrator().complete_project_todo(project_name, todo_content)
+            except Exception as exc:
+                logger.error("Failed to auto-complete escalated todo for {}: {}", project_name, exc)
+
     path.write_text(full_text, encoding="utf-8")
+    _write_state(state)
     return True
 
 
@@ -228,8 +299,8 @@ async def sync_all_projects() -> None:
         pstate = _project_state(state, project.name)
 
         try:
-            original_text = path.read_text(encoding="utf-8")
-            if not all(h in original_text for h in _SECTION_HEADERS):
+            full_text = path.read_text(encoding="utf-8")
+            if not all(h in full_text for h in _SECTION_HEADERS):
                 # Not a file managed by this protocol (e.g. a pre-existing,
                 # differently-formatted PROGRESS.md some project already
                 # had) — never touch it, just skip.
@@ -240,11 +311,9 @@ async def sync_all_projects() -> None:
                 continue
 
             pstate["cycle"] += 1
-            full_text = await _relay_discuss_items(project, original_text, pstate)
-            if full_text != original_text:
-                path.write_text(full_text, encoding="utf-8")
+            await _relay_discuss_items(project, full_text, pstate)
             await _maybe_relay_report(project, full_text, pstate)
-            await _escalate_stale_discuss_items(project, full_text, pstate)
+            await _escalate_stale_discuss_items(project, pstate)
         except Exception as exc:
             logger.error("Project sync failed for {}: {}", project.name, exc)
 

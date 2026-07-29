@@ -656,6 +656,21 @@ class Orchestrator:
             created += 1
         return created
 
+    async def complete_project_todo(self, project_name: str, content: str) -> bool:
+        """Auto-completes the Dashboard todo created when a "💬 待溝通/建議"
+        item got escalated (see project_sync.py) — called once the user
+        finally replies, so a stale-but-now-resolved todo doesn't linger.
+        Returns False if no matching todo exists (e.g. it was never
+        escalated in the first place, the common case)."""
+        source = f"claude:{project_name}"
+        async with self._session_maker() as db:
+            todo = await crud.find_todo_by_source_and_content(db, source, content)
+            if todo is None:
+                return False
+            await crud.update_todo_status(db, todo.id, "done")
+            await db.commit()
+        return True
+
     async def update_todo_status(self, todo_id: str, status: str) -> dict:
         async with self._session_maker() as db:
             todo = await crud.update_todo_status(db, uuid.UUID(todo_id), status)

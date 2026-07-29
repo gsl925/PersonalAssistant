@@ -448,6 +448,18 @@ async def find_todo_created_today(
     return result.scalar_one_or_none()
 
 
+async def find_todo_by_source_and_content(
+    db: AsyncSession, source: str, content: str
+) -> Todo | None:
+    """Same source+content match as find_todo_created_today, but without the
+    "today" constraint — used to find a todo that was escalated on some
+    earlier cycle so it can be auto-completed once the user finally replies."""
+    result = await db.execute(
+        select(Todo).where(and_(Todo.source == source, Todo.content == content))
+    )
+    return result.scalars().first()
+
+
 async def update_todo_status(
     db: AsyncSession, todo_id: uuid.UUID, status: str
 ) -> Todo | None:

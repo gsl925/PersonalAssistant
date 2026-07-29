@@ -366,7 +366,8 @@ class PersonalAssistantBot:
                     # the project's own Claude Code session picks it up from
                     # there (see SDD_PROGRESS_SYNC.md). Plain file write, so
                     # no background task/timeout handling needed.
-                    ok = await write_instruction(project_name, text)
+                    remainder = (text[: hashtag_match.start()] + text[hashtag_match.end() :]).strip()
+                    ok = await write_instruction(project_name, remainder)
                     if ok:
                         await update.message.reply_text(f"✅ 已記錄，會轉達給「{project.label}」")
                     else:
