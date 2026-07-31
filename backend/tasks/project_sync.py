@@ -1,13 +1,27 @@
 """Cross-project PROGRESS.md sync — see SDD_PROGRESS_SYNC.md.
 
 Personal Assistant is a mailman here, not an executor: it only reads/writes
-each tracked project's PROGRESS.md and relays to/from Telegram. It never
-invokes the `claude` CLI or executes anything — actual judgment and
-execution always happen inside that project's own Claude Code session,
-per the SDD handed to each tracked project.
+each tracked project's PROGRESS.md and relays to/from Telegram. Judgment and
+execution normally happen inside that project's own Claude Code session,
+per the SDD handed to each tracked project — PA itself never decides *what*
+to do.
+
+Two deliberate exceptions, both using the same headless "go check your
+mailbox" call (see claude_wake.py) — a fixed, generic prompt, not PA
+relaying/deciding the actual instruction content:
+
+- Automatic: for projects with `auto_wake: true` in projects.yaml, if a
+  "📮 你的指示" item sits unprocessed too long, PA fires the call unattended.
+  Off by default; opt in per project (autonomous execution with no
+  confirmation gate is a real trust boundary).
+- On-demand: Telegram's `/wake <project>` command fires the same call
+  immediately, for any tracked project regardless of `auto_wake` — the
+  opt-in flag guards *unattended* execution, not a user's own explicit,
+  in-the-moment request.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import datetime
@@ -37,6 +51,13 @@ _SECTION_HEADERS = [_REPORT_HEADER, _DISCUSS_HEADER, _INSTRUCT_HEADER]
 # sit relayed-but-undecided before it gets escalated into a Dashboard todo
 # so it doesn't quietly get lost in Telegram scroll.
 _ESCALATE_AFTER_CYCLES = 4  # ~2 hours at the 30-minute poll interval
+
+# Same idea for "📮 你的指示": how many cycles an unchecked item can sit
+# before auto_wake fires a headless claude call (auto_wake projects only).
+_WAKE_AFTER_CYCLES = 4  # ~2 hours at the 30-minute poll interval
+# Minimum cycles between wake attempts for the same project, so a wake that
+# didn't fully resolve everything doesn't get re-triggered every 30 minutes.
+_WAKE_COOLDOWN_CYCLES = 4  # ~2 hours
 
 _BULLET_PATTERN = re.compile(r"^- \[( |x)\] (.*)$")
 _UPDATED_AT_PATTERN = re.compile(r"- 更新時間:[ \t]*(.*)")
@@ -132,12 +153,31 @@ def _write_state(state: dict) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def get_projects_overview() -> list[dict]:
+    """All tracked projects plus each one's currently-unresolved "💬"
+    items — used by both the Telegram /projects command/ambient query and
+    the Dashboard's project-sync API. Plain sync read (state file only, no
+    network/DB), safe to call directly from either."""
+    state = _read_state()
+    overview = []
+    for project in load_tracked_projects():
+        pstate = state.get(project.name, {})
+        pending = [
+            {"number": item["number"], "content": item["content"]}
+            for item in pstate.get("awaiting_decision", [])
+        ]
+        overview.append({"name": project.name, "label": project.label, "pending_items": pending})
+    return overview
+
+
 def _project_state(state: dict, project_name: str) -> dict:
     pstate = state.setdefault(project_name, {})
     pstate.setdefault("cycle", 0)
     pstate.setdefault("last_report_time", None)
     pstate.setdefault("awaiting_decision", [])
     pstate.setdefault("next_item_number", 1)
+    pstate.setdefault("pending_instructions", [])
+    pstate.setdefault("last_wake_cycle", None)
     return pstate
 
 
@@ -218,6 +258,98 @@ async def _escalate_stale_discuss_items(project: TrackedProject, pstate: dict) -
             item["escalated"] = False
 
 
+async def _maybe_wake_project(project: TrackedProject, full_text: str, pstate: dict) -> None:
+    """For `auto_wake: true` projects, fire a headless claude_wake.wake_project()
+    call once an unchecked "📮 你的指示" item has sat for _WAKE_AFTER_CYCLES
+    cycles, subject to a _WAKE_COOLDOWN_CYCLES cooldown so a wake that didn't
+    fully resolve things isn't re-triggered every cycle. Runs as a background
+    task (not awaited here) so a slow/failed wake never blocks this cycle's
+    sync for the other tracked projects.
+    """
+    if not project.auto_wake:
+        return
+
+    sections = _split_sections(full_text)
+    open_bullets = [b for b in _extract_bullets(sections[_INSTRUCT_HEADER]) if not b["checked"]]
+
+    tracked = pstate["pending_instructions"]
+    still_open_content = {b["content"] for b in open_bullets}
+    # Drop tracking for items that got checked off or removed since last cycle.
+    tracked[:] = [t for t in tracked if t["content"] in still_open_content]
+    already_tracked_content = {t["content"] for t in tracked}
+    for bullet in open_bullets:
+        if bullet["content"] not in already_tracked_content:
+            tracked.append({"content": bullet["content"], "first_seen_cycle": pstate["cycle"]})
+
+    if not tracked:
+        return
+
+    oldest_age = max(pstate["cycle"] - t["first_seen_cycle"] for t in tracked)
+    if oldest_age < _WAKE_AFTER_CYCLES:
+        return
+
+    last_wake = pstate["last_wake_cycle"]
+    if last_wake is not None and pstate["cycle"] - last_wake < _WAKE_COOLDOWN_CYCLES:
+        return
+
+    pstate["last_wake_cycle"] = pstate["cycle"]  # set before await — avoid duplicate triggers
+    logger.info("Auto-waking {} — {} pending instruction(s), oldest age {} cycle(s).",
+                project.name, len(tracked), oldest_age)
+    await _send_relay(f"🔔 已喚醒「{project.label}」處理待處理指示，稍後會回報結果。\n\n#{project.name}")
+
+    async def _run_wake() -> None:
+        from backend.tasks.claude_wake import wake_project
+
+        result = await wake_project(project.repo_path)
+        if result["ok"]:
+            logger.info("Auto-wake completed for {}.", project.name)
+        else:
+            await _send_relay(f"❌ 喚醒「{project.label}」失敗：{result['error']}\n\n#{project.name}")
+
+    asyncio.create_task(_run_wake())
+
+
+# Projects currently running an on-demand wake — guards against a doubled-up
+# /wake command spawning two `claude` processes against the same repo at
+# once. In-memory only (not persisted): fine since a backend restart kills
+# any in-flight subprocess anyway, so there's nothing to resume.
+_wake_in_flight: set[str] = set()
+
+
+async def wake_now(project_name: str) -> dict:
+    """Explicit, on-demand wake — Telegram's `/wake <project>` command.
+
+    Unlike _maybe_wake_project's staleness trigger, this runs immediately
+    and unconditionally on request, for ANY tracked project regardless of
+    its `auto_wake` setting — the opt-in flag exists to gate *unattended*
+    execution, not a user's own explicit, in-the-moment ask.
+    """
+    project = next((p for p in load_tracked_projects() if p.name == project_name), None)
+    if project is None:
+        return {"status": "not_found"}
+    if not _progress_path(project).exists():
+        return {"status": "no_progress_file"}
+    if project_name in _wake_in_flight:
+        return {"status": "already_running"}
+
+    _wake_in_flight.add(project_name)
+
+    async def _run() -> None:
+        from backend.tasks.claude_wake import wake_project
+
+        try:
+            result = await wake_project(project.repo_path)
+            if result["ok"]:
+                await _send_relay(f"✅ 「{project.label}」處理完成。\n\n#{project.name}")
+            else:
+                await _send_relay(f"❌ 喚醒「{project.label}」失敗：{result['error']}\n\n#{project.name}")
+        finally:
+            _wake_in_flight.discard(project_name)
+
+    asyncio.create_task(_run())
+    return {"status": "started", "label": project.label}
+
+
 async def write_instruction(project_name: str, text: str) -> bool:
     """Called by telegram_bot.py when the user replies with a project's
     hashtag — appends *text* as a new unchecked line under "📮 你的指示".
@@ -286,6 +418,22 @@ async def write_instruction(project_name: str, text: str) -> bool:
     return True
 
 
+def remove_project(project_name: str) -> bool:
+    """Delete a tracked project from projects.yaml and drop its leftover
+    sync state (awaiting_decision items, cycle counters). Only touches PA's
+    own side — never modifies the project's own repo/PROGRESS.md. Used by
+    the Dashboard's "delete project" action to clean up experiments that
+    are no longer worth tracking."""
+    from backend.config import remove_tracked_project
+
+    removed = remove_tracked_project(project_name)
+    if removed:
+        state = _read_state()
+        if state.pop(project_name, None) is not None:
+            _write_state(state)
+    return removed
+
+
 async def sync_all_projects() -> None:
     """Main entry point — polled every 30 min by scheduler.py. One project's
     failure never stops the others."""
@@ -314,6 +462,7 @@ async def sync_all_projects() -> None:
             await _relay_discuss_items(project, full_text, pstate)
             await _maybe_relay_report(project, full_text, pstate)
             await _escalate_stale_discuss_items(project, pstate)
+            await _maybe_wake_project(project, full_text, pstate)
         except Exception as exc:
             logger.error("Project sync failed for {}: {}", project.name, exc)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -222,6 +223,31 @@ async def get_document(
     return _doc_to_out(doc)
 
 
+@router.delete("/documents/{doc_id}", response_model=dict)
+async def delete_document(doc_id: uuid.UUID, db: DbDep) -> dict:
+    """Delete a note/document — the DB row (cascades to its tags/project
+    links), its Qdrant vector, and its uploaded file (if any). Used to clean
+    up experimental/test captures from the Dashboard."""
+    from backend.main import get_qdrant_client
+
+    ok, file_path = await crud.delete_document(db, doc_id)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    try:
+        await get_qdrant_client().delete_document(str(doc_id))
+    except Exception as exc:
+        logger.warning("Failed to delete Qdrant vector for {}: {}", doc_id, exc)
+
+    if file_path:
+        try:
+            Path(file_path).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Failed to delete file {} for document {}: {}", file_path, doc_id, exc)
+
+    return {"ok": True}
+
+
 @router.post("/documents/{doc_id}/retry", response_model=RetryResponse)
 async def retry_document(
     doc_id: uuid.UUID,
@@ -271,6 +297,16 @@ async def list_projects(db: DbDep) -> list[ProjectOut]:
         )
         for p in projects
     ]
+
+
+@router.delete("/projects/{project_id}", response_model=dict)
+async def delete_project(project_id: uuid.UUID, db: DbDep) -> dict:
+    """Delete a project tag — documents keep existing, they just lose the
+    project link. Used to clean up experimental/test project tags."""
+    ok = await crud.delete_project(db, project_id)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+    return {"ok": True}
 
 
 @router.get("/projects/{project_id}/documents", response_model=DocumentListResponse)

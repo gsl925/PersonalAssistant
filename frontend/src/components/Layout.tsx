@@ -2,12 +2,14 @@ import { NavLink, Outlet } from "react-router-dom";
 import SearchBox from "./SearchBox";
 
 const LINKS = [
-  { to: "/", label: "Project" },
+  { to: "/", label: "知識庫" },
   { to: "/timeline", label: "Timeline" },
   { to: "/mindmap", label: "Mindmap" },
   { to: "/actions", label: "會議代辦" },
   { to: "/todos", label: "快速代辦" },
+  { to: "/chat", label: "問答記錄" },
   { to: "/agents", label: "Agents" },
+  { to: "/project-sync", label: "跨 Repo 同步" },
   { to: "/settings", label: "設定" },
 ];
 

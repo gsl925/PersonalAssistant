@@ -5,7 +5,7 @@ import type { Document, DocumentFilters, Project } from "../api/types";
 import DocumentCard from "./DocumentCard";
 import DocumentDetail from "./DocumentDetail";
 
-const SOURCE_TYPES = ["doc", "note", "webclip", "meeting", "screenshot"];
+const SOURCE_TYPES = ["doc", "note", "webclip", "meeting", "screenshot", "chat"];
 
 export default function TimelineView() {
   const [docs, setDocs] = useState<Document[]>([]);
@@ -22,7 +22,11 @@ export default function TimelineView() {
     setLoading(true);
     api
       .listTimeline(filters)
-      .then((res) => setDocs(res.items))
+      // Chat Q&A lives on its own "問答記錄" tab — hidden here unless the
+      // "chat" filter is picked explicitly.
+      .then((res) => setDocs(
+        filters.source_type ? res.items : res.items.filter((d) => d.source_type !== "chat")
+      ))
       .finally(() => setLoading(false));
   }
 
@@ -98,7 +102,12 @@ export default function TimelineView() {
             </div>
             <div style={{ paddingLeft: 12, borderLeft: "2px solid var(--border)" }}>
               {items.map((d) => (
-                <DocumentCard key={d.id} doc={d} onSelect={setSelectedDoc} />
+                <DocumentCard
+                  key={d.id}
+                  doc={d}
+                  onSelect={setSelectedDoc}
+                  onDeleted={(id) => setDocs((prev) => prev.filter((x) => x.id !== id))}
+                />
               ))}
             </div>
           </div>

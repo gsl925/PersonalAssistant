@@ -116,6 +116,9 @@ class PersonalAssistantBot:
         add(CommandHandler("start", self.handle_start))
         add(CommandHandler("status", self.handle_status))
         add(CommandHandler("todo", self.handle_todo_command))
+        add(CommandHandler("ask", self.handle_ask_command))
+        add(CommandHandler("wake", self.handle_wake_command))
+        add(CommandHandler("projects", self.handle_projects_command))
 
         # Specific media types — registered before the broad TEXT filter.
         add(MessageHandler(filters.PHOTO, self.handle_photo))
@@ -155,6 +158,7 @@ class PersonalAssistantBot:
             "• 🎬 影片 — 語音轉錄摘要\n\n"
             f"點下方的「{self._QUICK_TODO_BUTTON_TEXT}」按鈕，或直接輸入 /todo 內容，"
             "可以明確新增一筆代辦（不用等我猜）。\n\n"
+            "跟專案無關、單純想問問題的話，用 /ask 你的問題。\n\n"
             "使用 /status 查看目前狀態。"
         )
         keyboard = ReplyKeyboardMarkup(
@@ -193,6 +197,80 @@ class PersonalAssistantBot:
         except Exception as exc:
             logger.exception("handle_todo_command error: {}", exc)
             await update.message.reply_text(f"❌ 建立代辦時發生錯誤：{exc}")
+
+    async def handle_ask_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """One-off Claude chat via ``/ask <question>`` — unrelated to any
+        tracked project/note. Runs a stateless headless `claude -p` call
+        (see claude_chat.py), not this app's own agent-routing pipeline, and
+        answers directly instead of the usual "已儲存至知識庫" note format —
+        the point of /ask is to read the answer, not a truncated preview."""
+        self._cache_chat_id(update)
+        question = " ".join(context.args or []).strip()
+        if not question:
+            await update.message.reply_text("用法：/ask 你的問題，例如 /ask 台北明天天氣如何")
+            return
+
+        thinking_msg = await update.message.reply_text("🤔 思考中…")
+        try:
+            result = await self.orchestrator.ask_claude(question)
+            if result["status"] == "completed":
+                await thinking_msg.edit_text(result["summary"][:4096])
+            else:
+                await thinking_msg.edit_text(f"❌ {result.get('message', '發生錯誤')}")
+        except Exception as exc:
+            logger.exception("handle_ask_command error: {}", exc)
+            await thinking_msg.edit_text(f"❌ 回答時發生錯誤：{exc}")
+
+    async def handle_wake_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """On-demand ``/wake <project-slug>`` — immediately fires the same
+        headless "check your mailbox" call project_sync.py's staleness
+        detector uses, for any tracked project regardless of its
+        `auto_wake` setting (an explicit ask carries its own consent).
+        See project_sync.wake_now()."""
+        self._cache_chat_id(update)
+        project_name = " ".join(context.args or []).strip().lower()
+        if not project_name:
+            await update.message.reply_text("用法：/wake 專案代稱，例如 /wake genai-news")
+            return
+
+        from backend.tasks.project_sync import wake_now
+
+        result = await wake_now(project_name)
+        status = result["status"]
+        if status == "started":
+            await update.message.reply_text(f"🔔 已喚醒「{result['label']}」，處理中，完成後會回報結果。")
+        elif status == "not_found":
+            await update.message.reply_text(f"❌ 找不到專案「{project_name}」，用 /projects 查看正確代稱。")
+        elif status == "no_progress_file":
+            await update.message.reply_text(f"❌ 「{project_name}」還沒有 PROGRESS.md，無法喚醒。")
+        elif status == "already_running":
+            await update.message.reply_text(f"⏳ 「{project_name}」目前已經在處理中，請等它跑完再試一次。")
+
+    async def handle_projects_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        self._cache_chat_id(update)
+        await self._reply_projects_overview(update)
+
+    async def _reply_projects_overview(self, update: Update) -> None:
+        """Shared by /projects and the ambient "哪些專案被觀察" detection in
+        handle_text() — both just want the same list+reply."""
+        from backend.tasks.project_sync import get_projects_overview
+
+        await update.message.reply_text(self._format_projects_overview(get_projects_overview()))
+
+    @staticmethod
+    def _format_projects_overview(overview: list[dict]) -> str:
+        lines = ["📂 目前追蹤的專案："]
+        for p in overview:
+            lines.append(f"\n• {p['label']}（#{p['name']}） — {len(p['pending_items'])} 筆待決策")
+            for item in p["pending_items"]:
+                lines.append(f"   #{item['number']} {item['content']}")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Media handlers
@@ -307,11 +385,15 @@ class PersonalAssistantBot:
     # ------------------------------------------------------------------
 
     _TODO_INTENT_PATTERN = re.compile(r"代辦|待辦|todo|to-do|action[\s-]?items?", re.IGNORECASE)
-    # Matches the "#project-slug" hashtag the daily cross-project check-in
-    # report tags each message with (see claude_checkin.py) — a reply
-    # containing it is the user's go-ahead to actually execute for that
-    # project. See DESIGN_每日跨專案進度確認機制.md §3.4.
-    _PROJECT_HASHTAG_PATTERN = re.compile(r"#([a-z0-9\-]+)")
+    # Matches the "#project-slug" hashtag project_sync.py tags each relayed
+    # PROGRESS.md message with — a reply containing it gets written into
+    # that project's "📮 你的指示" section. See SDD_PROGRESS_SYNC.md.
+    _PROJECT_HASHTAG_PATTERN = re.compile(r"#([a-zA-Z0-9\-]+)")
+    # "現在有哪些專案被觀察/追蹤" style queries — see _reply_projects_overview.
+    _PROJECTS_QUERY_PATTERN = re.compile(
+        r"(哪些|哪個|which)[^\n]{0,10}(專案|project)|(專案|project)[^\n]{0,10}(觀察|追蹤|監控|清單|list|watch)",
+        re.IGNORECASE,
+    )
 
     async def handle_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -356,7 +438,7 @@ class PersonalAssistantBot:
                 from backend.config import load_tracked_projects
                 from backend.tasks.project_sync import write_instruction
 
-                project_name = hashtag_match.group(1)
+                project_name = hashtag_match.group(1).lower()
                 project = next(
                     (p for p in load_tracked_projects() if p.name == project_name), None
                 )
@@ -383,6 +465,11 @@ class PersonalAssistantBot:
                 result = await self.orchestrator.process_input("url", text)
                 prefix = "🔗 "
                 await self._dispatch_result(update, result, prefix=prefix)
+                return
+
+            if self._PROJECTS_QUERY_PATTERN.search(text):
+                logger.info("Text classified as projects-overview query: {:.60}", text)
+                await self._reply_projects_overview(update)
                 return
 
             if self._TODO_INTENT_PATTERN.search(text):
@@ -630,6 +717,9 @@ class PersonalAssistantBot:
             BotCommand("start", "顯示歡迎訊息"),
             BotCommand("status", "查看系統狀態"),
             BotCommand("todo", "新增一筆代辦，例如 /todo 記得繳電費 8/5 前"),
+            BotCommand("ask", "問 Claude 一個跟專案無關的問題，例如 /ask 台北明天天氣如何"),
+            BotCommand("wake", "立刻喚醒某個追蹤中的專案去處理 PROGRESS.md，例如 /wake genai-news"),
+            BotCommand("projects", "查看目前追蹤的專案與待決策項目"),
         ])
         await self.app.start()
         await self.app.updater.start_polling(drop_pending_updates=True)

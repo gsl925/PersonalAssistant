@@ -520,6 +520,58 @@ class Orchestrator:
             "content": None, "start_date": None, "due_date": None,
         }
 
+    async def ask_claude(self, question: str) -> dict:
+        """Explicit-intent one-off chat — Telegram's ``/ask`` command.
+
+        Unlike ``process_input``, there's no adapter/agent routing to do: the
+        answer comes straight from a headless `claude -p` call (see
+        claude_chat.py), not this app's own model_router/skills pipeline.
+        Saved as source_type="chat" so it's searchable later like any other
+        note, but skips the confidence-based routing entirely since there's
+        no ambiguity about what to do with it.
+        """
+        from backend.adapters.base import ProcessedContent
+        from backend.tasks.claude_chat import ask_claude as run_claude_chat
+
+        async with self._session_maker() as db:
+            doc = await crud.create_document(db, source_type="chat", processing_status="pending")
+            await db.commit()
+            doc_id = doc.id
+
+        result = await run_claude_chat(question)
+        if not result["ok"]:
+            await self._mark_failed(doc_id, result["error"], original_content=question)
+            return {"status": "failed", "doc_id": str(doc_id), "message": result["error"]}
+
+        answer = result["answer"]
+        title = question if len(question) <= 100 else question[:100] + "…"
+        original_content = f"Q: {question}\n\nA: {answer}"
+
+        async with self._session_maker() as db:
+            await crud.update_document_status(
+                db, doc_id, "completed",
+                title=title,
+                original_content=original_content,
+                summary=answer,
+                category="chat",
+            )
+            await db.commit()
+
+        processed = ProcessedContent(
+            source_type="chat", original_content=original_content, title=title
+        )
+        await self._post_process(doc_id, processed, {"summary": answer, "category": "chat"})
+
+        return {
+            "status": "completed",
+            "doc_id": str(doc_id),
+            "message": "已回答並存入知識庫",
+            "title": title,
+            "summary": answer,
+            "category": "chat",
+            "tags": [],
+        }
+
     async def create_todo_from_text(self, text: str, source: str) -> dict:
         """Explicit-intent todo creation — used by the desktop widget, the
         dashboard quick-add form, and Telegram's ``/todo`` command. Intent is

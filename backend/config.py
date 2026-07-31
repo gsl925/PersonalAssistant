@@ -179,6 +179,12 @@ class TrackedProject(BaseModel):
     label: str
     repo_path: str
     enabled: bool = True
+    # Opt-in per project: when a "📮 你的指示" item sits unprocessed too long,
+    # project_sync.py fires an unattended, fully-autonomous `claude -p` call
+    # scoped to this repo (can edit files / run Bash, no confirmation gate —
+    # see claude_wake.py). Off by default since that's a meaningfully bigger
+    # trust boundary than the read-only mailman relay.
+    auto_wake: bool = False
 
 
 def load_tracked_projects() -> list[TrackedProject]:
@@ -198,3 +204,28 @@ def load_tracked_projects() -> list[TrackedProject]:
         logger.error("Failed to parse {}: {}", path, exc)
         return []
     return [p for p in projects if p.enabled]
+
+
+def remove_tracked_project(name: str) -> bool:
+    """Remove a project entry from projects.yaml by its `name` slug.
+
+    Returns False if the file or the named entry doesn't exist. Used by the
+    Dashboard's "delete project" action to declutter tracked experiments —
+    edits the config file directly since projects.yaml is the single source
+    of truth load_tracked_projects() reads fresh on every call.
+    """
+    path = settings.PROJECTS_YAML_PATH
+    if not path.exists():
+        return False
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        logger.error("Failed to parse {}: {}", path, exc)
+        return False
+    entries = data.get("projects", [])
+    remaining = [e for e in entries if e.get("name") != name]
+    if len(remaining) == len(entries):
+        return False
+    data["projects"] = remaining
+    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return True

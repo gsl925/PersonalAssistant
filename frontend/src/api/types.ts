@@ -142,6 +142,27 @@ export interface RetryResponse {
   tags?: string[] | null;
 }
 
+// --- project_sync.py ---
+// TrackedProject* naming is deliberate — don't call this "Project"/"Projects":
+// that name is already taken above by the knowledge-base "Project" (a
+// document-grouping entity, /api/knowledge/projects). This is a completely
+// different concept (an entry from the backend's projects.yaml).
+
+export interface PendingDiscussItem {
+  number: number;
+  content: string;
+}
+
+export interface TrackedProjectOut {
+  name: string;
+  label: string;
+  pending_items: PendingDiscussItem[];
+}
+
+export interface TrackedProjectListResponse {
+  items: TrackedProjectOut[];
+}
+
 // --- settings.py ---
 
 export interface ModelEntry {

@@ -18,6 +18,7 @@ import type {
   DigestStatusResponse,
   Todo,
   TodoListResponse,
+  TrackedProjectListResponse,
 } from "./types";
 
 class ApiError extends Error {
@@ -77,8 +78,16 @@ export const api = {
     return request(`/api/knowledge/documents/${docId}/retry`, { method: "POST" });
   },
 
+  deleteDocument(docId: string): Promise<{ ok: boolean }> {
+    return request(`/api/knowledge/documents/${docId}`, { method: "DELETE" });
+  },
+
   listProjects(): Promise<Project[]> {
     return request(`/api/knowledge/projects`);
+  },
+
+  deleteProject(projectId: string): Promise<{ ok: boolean }> {
+    return request(`/api/knowledge/projects/${projectId}`, { method: "DELETE" });
   },
 
   listProjectDocuments(
@@ -169,6 +178,23 @@ export const api = {
 
   snoozeTodo(todoId: string): Promise<{ status: string; todo_id: string; remind_at: string }> {
     return request(`/api/todos/${todoId}/snooze`, { method: "POST" });
+  },
+
+  listTrackedProjects(): Promise<TrackedProjectListResponse> {
+    return request(`/api/project-sync/projects`);
+  },
+
+  sendProjectInstruction(projectName: string, text: string): Promise<{ ok: boolean }> {
+    return request(`/api/project-sync/instruction`, {
+      method: "POST",
+      body: JSON.stringify({ project_name: projectName, text }),
+    });
+  },
+
+  deleteTrackedProject(projectName: string): Promise<{ ok: boolean }> {
+    return request(`/api/project-sync/projects/${encodeURIComponent(projectName)}`, {
+      method: "DELETE",
+    });
   },
 };
 

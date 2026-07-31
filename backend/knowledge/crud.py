@@ -119,6 +119,21 @@ async def get_documents(
     return result.scalars().all()
 
 
+async def delete_document(db: AsyncSession, doc_id: uuid.UUID) -> tuple[bool, str | None]:
+    """Delete a document row — cascades to its tags/project links/relations
+    (cascade="all, delete-orphan" on Document's relationships). Returns
+    (False, None) if it didn't exist, else (True, file_path) so the caller
+    can also clean up the Qdrant vector and on-disk upload, which live
+    outside the DB and aren't cascaded automatically."""
+    document = await db.get(Document, doc_id)
+    if document is None:
+        return False, None
+    file_path = document.file_path
+    await db.delete(document)
+    await db.flush()
+    return True, file_path
+
+
 async def get_meeting_documents_with_action_items(db: AsyncSession) -> Sequence[Document]:
     """Completed meeting documents that have any per-skill output stored —
     callers flatten ``type_specific_data["action_items"]`` themselves since
@@ -254,6 +269,18 @@ async def get_projects(db: AsyncSession) -> Sequence[Project]:
         select(Project).where(Project.status == "active").order_by(Project.name)
     )
     return result.scalars().all()
+
+
+async def delete_project(db: AsyncSession, project_id: uuid.UUID) -> bool:
+    """Delete a project tag. Only removes the Project row and its
+    DocumentProject links (cascade="all, delete-orphan" on Project.document_links)
+    — the documents themselves are untouched, just unlinked from this project."""
+    project = await db.get(Project, project_id)
+    if project is None:
+        return False
+    await db.delete(project)
+    await db.flush()
+    return True
 
 
 async def get_project_documents(
