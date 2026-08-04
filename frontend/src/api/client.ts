@@ -19,6 +19,8 @@ import type {
   Todo,
   TodoListResponse,
   TrackedProjectListResponse,
+  AddTrackedProjectResponse,
+  BroadcastInstructionResponse,
 } from "./types";
 
 class ApiError extends Error {
@@ -165,6 +167,27 @@ export const api = {
     });
   },
 
+  createRecurringTodo(
+    content: string,
+    frequency: string,
+    weekday: number | null,
+    dayOfMonth: number | null,
+    time: string,
+    source = "dashboard"
+  ): Promise<Todo> {
+    return request(`/api/todos/recurring`, {
+      method: "POST",
+      body: JSON.stringify({
+        content,
+        source,
+        frequency,
+        weekday,
+        day_of_month: dayOfMonth,
+        time,
+      }),
+    });
+  },
+
   listTodos(params: { status?: string; due_before?: string } = {}): Promise<TodoListResponse> {
     return request(`/api/todos${buildQuery(params)}`);
   },
@@ -184,10 +207,24 @@ export const api = {
     return request(`/api/project-sync/projects`);
   },
 
+  addTrackedProject(label: string, repoPath: string): Promise<AddTrackedProjectResponse> {
+    return request(`/api/project-sync/projects`, {
+      method: "POST",
+      body: JSON.stringify({ label, repo_path: repoPath }),
+    });
+  },
+
   sendProjectInstruction(projectName: string, text: string): Promise<{ ok: boolean }> {
     return request(`/api/project-sync/instruction`, {
       method: "POST",
       body: JSON.stringify({ project_name: projectName, text }),
+    });
+  },
+
+  broadcastInstruction(text: string): Promise<BroadcastInstructionResponse> {
+    return request(`/api/project-sync/broadcast`, {
+      method: "POST",
+      body: JSON.stringify({ text }),
     });
   },
 

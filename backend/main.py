@@ -20,6 +20,21 @@ from backend.orchestrator import Orchestrator
 from backend.skills_loader import SkillsLoader
 
 # ---------------------------------------------------------------------------
+# Persistent file logging — loguru's default sink is stderr only, so a
+# background failure (e.g. project_sync's Telegram relay silently erroring
+# every cycle) only ever showed up in whichever console window happened to
+# be running the backend, with nothing to read back after the fact. This
+# adds a rotating file sink alongside the existing console output.
+# ---------------------------------------------------------------------------
+logger.add(
+    settings.BASE_DIR / "logs" / "backend_{time:YYYY-MM-DD}.log",
+    rotation="00:00",
+    retention="14 days",
+    encoding="utf-8",
+    level="INFO",
+)
+
+# ---------------------------------------------------------------------------
 # Application-level singletons
 # ---------------------------------------------------------------------------
 # These are created once during startup and accessed via getter functions that

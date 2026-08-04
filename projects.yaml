@@ -1,7 +1,7 @@
 projects:
   - name: genai-news
     label: "GenAI News"
-    repo_path: "D:/_SideProject/GenAI_News"
+    repo_path: "D:/_SideProject/Topic_News/genai"
     enabled: true
     auto_wake: false  # verified working 2026-07-30 — turn back on if needed, see claude_wake.py
   - name: personal-assistant

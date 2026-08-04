@@ -6,7 +6,7 @@ The scheduler is started/stopped inside the FastAPI lifespan context.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -83,6 +83,59 @@ def schedule_todo_reminder(scheduler: AsyncIOScheduler, reminder_id: str, remind
     )
 
 
+def schedule_recurring_todo(
+    scheduler: AsyncIOScheduler,
+    todo_id: str,
+    frequency: str,
+    weekday: int | None,
+    day_of_month: int | None,
+    remind_time: time,
+) -> None:
+    """Add (or replace) the CronTrigger job for a recurring todo — one job
+    per todo (unlike one-off reminders, which are one job per TodoReminder
+    row), since a recurring todo never accumulates multiple pending
+    TodoReminder rows in the first place. Mirrors the daily_digest job above,
+    the only other CronTrigger in this codebase.
+    """
+    from backend.tasks.processing import send_recurring_todo_reminder
+
+    kwargs = {"hour": remind_time.hour, "minute": remind_time.minute, "timezone": "Asia/Taipei"}
+    if frequency == "weekly":
+        kwargs["day_of_week"] = weekday
+    elif frequency == "monthly":
+        kwargs["day"] = day_of_month
+    scheduler.add_job(
+        send_recurring_todo_reminder,
+        trigger=CronTrigger(**kwargs),
+        id=f"todo_recurring_{todo_id}",
+        args=[todo_id],
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+
+async def _reschedule_recurring_todos(scheduler: AsyncIOScheduler) -> None:
+    """Re-register recurring todos' CronTrigger jobs lost on restart (same
+    MemoryJobStore limitation as _reschedule_pending_todo_reminders below)."""
+    from backend.knowledge import crud
+    from backend.knowledge.db import async_session_maker
+
+    async with async_session_maker() as db:
+        todos = await crud.list_recurring_todos(db)
+
+    for todo in todos:
+        schedule_recurring_todo(
+            scheduler,
+            str(todo.id),
+            todo.recurrence_frequency,
+            todo.recurrence_weekday,
+            todo.recurrence_day_of_month,
+            todo.recurrence_time,
+        )
+    if todos:
+        logger.info("Rescheduled {} recurring todo job(s) after restart.", len(todos))
+
+
 async def _reschedule_pending_todo_reminders(scheduler: AsyncIOScheduler) -> None:
     """Re-register reminder jobs lost on restart (MemoryJobStore doesn't persist)."""
     from backend.knowledge import crud
@@ -105,6 +158,7 @@ async def start_scheduler() -> AsyncIOScheduler:
     scheduler = get_scheduler()
     setup_jobs(scheduler)
     await _reschedule_pending_todo_reminders(scheduler)
+    await _reschedule_recurring_todos(scheduler)
     scheduler.start()
     logger.info("APScheduler started ({} jobs).", len(scheduler.get_jobs()))
 

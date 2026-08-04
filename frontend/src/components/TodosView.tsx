@@ -10,6 +10,14 @@ export default function TodosView() {
   const [saveMsg, setSaveMsg] = useState("");
   const [snoozeMsg, setSnoozeMsg] = useState<Record<string, string>>({});
 
+  const [recContent, setRecContent] = useState("");
+  const [recFrequency, setRecFrequency] = useState<"daily" | "weekly" | "monthly">("weekly");
+  const [recWeekday, setRecWeekday] = useState(0);
+  const [recDayOfMonth, setRecDayOfMonth] = useState(1);
+  const [recTime, setRecTime] = useState("09:00");
+  const [recSaving, setRecSaving] = useState(false);
+  const [recMsg, setRecMsg] = useState("");
+
   function load() {
     setLoading(true);
     api
@@ -34,6 +42,42 @@ export default function TodosView() {
       setSaveMsg(err instanceof Error ? `✗ ${err.message}` : "✗ 發生錯誤");
     } finally {
       setSaving(false);
+    }
+  }
+
+  const WEEKDAY_LABELS = ["一", "二", "三", "四", "五", "六", "日"];
+  const FREQUENCY_LABELS: Record<string, string> = { daily: "每天", weekly: "每週", monthly: "每月" };
+
+  function recurrenceLabel(r: { frequency: string; weekday: number | null; day_of_month: number | null; time: string }) {
+    if (r.frequency === "weekly" && r.weekday !== null) {
+      return `每週${WEEKDAY_LABELS[r.weekday]} ${r.time}`;
+    }
+    if (r.frequency === "monthly" && r.day_of_month !== null) {
+      return `每月${r.day_of_month}號 ${r.time}`;
+    }
+    return `${FREQUENCY_LABELS[r.frequency] ?? r.frequency} ${r.time}`;
+  }
+
+  async function addRecurringTodo() {
+    const trimmed = recContent.trim();
+    if (!trimmed) return;
+    setRecSaving(true);
+    setRecMsg("");
+    try {
+      await api.createRecurringTodo(
+        trimmed,
+        recFrequency,
+        recFrequency === "weekly" ? recWeekday : null,
+        recFrequency === "monthly" ? recDayOfMonth : null,
+        recTime
+      );
+      setRecContent("");
+      setRecMsg("✓ 已建立週期性提醒");
+      load();
+    } catch (err) {
+      setRecMsg(err instanceof Error ? `✗ ${err.message}` : "✗ 發生錯誤");
+    } finally {
+      setRecSaving(false);
     }
   }
 
@@ -78,6 +122,51 @@ export default function TodosView() {
         </p>
       )}
 
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>🔁 新增週期性提醒</div>
+        <div className="filter-bar" style={{ marginBottom: 6 }}>
+          <input
+            type="text"
+            placeholder="內容，例如：倒垃圾"
+            value={recContent}
+            onChange={(e) => setRecContent(e.target.value)}
+            style={{ flex: 1 }}
+          />
+          <select
+            value={recFrequency}
+            onChange={(e) => setRecFrequency(e.target.value as "daily" | "weekly" | "monthly")}
+          >
+            <option value="daily">每天</option>
+            <option value="weekly">每週</option>
+            <option value="monthly">每月</option>
+          </select>
+          {recFrequency === "weekly" && (
+            <select value={recWeekday} onChange={(e) => setRecWeekday(Number(e.target.value))}>
+              {WEEKDAY_LABELS.map((label, i) => (
+                <option key={i} value={i}>
+                  週{label}
+                </option>
+              ))}
+            </select>
+          )}
+          {recFrequency === "monthly" && (
+            <input
+              type="number"
+              min={1}
+              max={31}
+              value={recDayOfMonth}
+              onChange={(e) => setRecDayOfMonth(Number(e.target.value))}
+              style={{ width: 60 }}
+            />
+          )}
+          <input type="time" value={recTime} onChange={(e) => setRecTime(e.target.value)} />
+          <button className="primary" onClick={addRecurringTodo} disabled={recSaving}>
+            {recSaving ? "新增中…" : "+ 新增"}
+          </button>
+        </div>
+        {recMsg && <p className="muted" style={{ fontSize: 12 }}>{recMsg}</p>}
+      </div>
+
       {loading ? (
         <p className="muted">載入中…</p>
       ) : sorted.length === 0 ? (
@@ -89,6 +178,7 @@ export default function TodosView() {
             <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
               {item.start_date && <>🗓️ {item.start_date} </>}
               {item.due_date && <>⏰ {item.due_date} </>}
+              {item.recurrence && <>🔁 {recurrenceLabel(item.recurrence)} </>}
               · 來源：{item.source}
             </div>
             {item.reminders && item.reminders.length > 0 && (

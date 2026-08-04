@@ -2,7 +2,7 @@ import * as d3 from "d3";
 import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
-import type { MindmapResponse } from "../api/types";
+import type { Document, MindmapResponse } from "../api/types";
 
 const RELATION_COLOR: Record<string, string> = {
   semantic: "#3b6fd9",
@@ -23,7 +23,16 @@ export default function MindmapView() {
   const [suggestions, setSuggestions] = useState<{ id: string; title: string }[]>([]);
   const [mindmap, setMindmap] = useState<MindmapResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [recent, setRecent] = useState<Document[]>([]);
   const svgRef = useRef<SVGSVGElement>(null);
+
+  useEffect(() => {
+    if (centerId) return;
+    api
+      .listDocuments({ limit: 8 })
+      .then((res) => setRecent(res.items))
+      .catch(() => setRecent([]));
+  }, [centerId]);
 
   useEffect(() => {
     if (!centerId) {
@@ -192,10 +201,42 @@ export default function MindmapView() {
         )}
       </div>
 
-      {!centerId && <p className="muted">搜尋並選擇一份文件，作為關聯圖的中心節點。</p>}
+      {!centerId && (
+        <div>
+          <p className="muted" style={{ fontSize: 13, marginBottom: 8 }}>
+            搜尋文件，或從下面挑一份最近的文件，作為關聯圖的中心節點：
+          </p>
+          {recent.length === 0 ? (
+            <p className="muted">知識庫還沒有文件。</p>
+          ) : (
+            recent.map((doc) => (
+              <div
+                key={doc.id}
+                className="card"
+                style={{ marginBottom: 8, cursor: "pointer" }}
+                onClick={() => setSearchParams({ doc: doc.id })}
+              >
+                <div style={{ fontWeight: 600, fontSize: 13 }}>
+                  {doc.title || doc.id.slice(0, 8)}
+                </div>
+                <div className="muted" style={{ fontSize: 12, marginTop: 2 }}>
+                  {doc.source_type} · {doc.created_at.slice(0, 10)}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      )}
       {error && <p style={{ color: "var(--danger)" }}>{error}</p>}
 
-      <svg ref={svgRef} width="100%" height={560} style={{ border: "1px solid var(--border)", borderRadius: 8 }} />
+      {centerId && (
+        <svg
+          ref={svgRef}
+          width="100%"
+          height={560}
+          style={{ border: "1px solid var(--border)", borderRadius: 8 }}
+        />
+      )}
     </div>
   );
 }

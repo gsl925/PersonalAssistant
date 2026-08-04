@@ -41,6 +41,22 @@ class ReminderOut(BaseModel):
     remind_at: str
 
 
+class RecurrenceOut(BaseModel):
+    frequency: str
+    weekday: int | None = None
+    day_of_month: int | None = None
+    time: str
+
+
+class CreateRecurringTodoRequest(BaseModel):
+    content: str
+    source: str = "dashboard"
+    frequency: str
+    weekday: int | None = None
+    day_of_month: int | None = None
+    time: str = "09:00"
+
+
 class TodoOut(BaseModel):
     id: str
     content: str
@@ -49,6 +65,7 @@ class TodoOut(BaseModel):
     due_date: str | None = None
     source: str
     source_url: str | None = None
+    recurrence: RecurrenceOut | None = None
     created_at: datetime
     reminders: list[ReminderOut] | None = None
 
@@ -79,6 +96,23 @@ async def create_todo(
     extraction.
     """
     result = await orchestrator.create_todo_from_text(body.text, source=body.source)
+    return TodoOut(**result)
+
+
+@router.post("/recurring", response_model=TodoOut)
+async def create_recurring_todo(
+    body: CreateRecurringTodoRequest,
+    orchestrator: OrchestratorDep,
+) -> TodoOut:
+    """Dashboard's manual "🔁 新增週期性提醒" form — structured fields from a
+    frequency dropdown, no LLM extraction involved (see the free-text
+    `POST /api/todos` above for the natural-language path, which detects
+    recurrence on its own)."""
+    result = await orchestrator.create_recurring_todo(
+        body.content, body.source, body.frequency, body.weekday, body.day_of_month, body.time,
+    )
+    if result.get("status") == "failed":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result["message"])
     return TodoOut(**result)
 
 

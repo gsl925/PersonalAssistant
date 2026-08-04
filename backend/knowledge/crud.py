@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import and_, func, or_, select
@@ -402,6 +402,10 @@ async def create_todo(
     source_url: str | None = None,
     start_date: date | None = None,
     due_date: date | None = None,
+    recurrence_frequency: str | None = None,
+    recurrence_weekday: int | None = None,
+    recurrence_day_of_month: int | None = None,
+    recurrence_time: time | None = None,
 ) -> Todo:
     todo = Todo(
         id=uuid.uuid4(),
@@ -411,6 +415,10 @@ async def create_todo(
         source_url=source_url,
         start_date=start_date,
         due_date=due_date,
+        recurrence_frequency=recurrence_frequency,
+        recurrence_weekday=recurrence_weekday,
+        recurrence_day_of_month=recurrence_day_of_month,
+        recurrence_time=recurrence_time,
     )
     db.add(todo)
     await db.flush()
@@ -497,6 +505,21 @@ async def update_todo_status(
     todo.updated_at = datetime.now(timezone.utc)
     await db.flush()
     return todo
+
+
+async def list_recurring_todos(db: AsyncSession) -> Sequence[Todo]:
+    """Active recurring todos — used to re-register their CronTrigger jobs on
+    startup, since AsyncIOScheduler's MemoryJobStore loses everything across
+    restarts (same reason list_pending_todo_reminders exists for the one-off
+    reminder jobs). "done" doesn't exclude a todo here — only "cancelled"
+    stops future recurrence, by design."""
+    result = await db.execute(
+        select(Todo).where(
+            Todo.recurrence_frequency.isnot(None),
+            Todo.status != "cancelled",
+        )
+    )
+    return result.scalars().all()
 
 
 async def list_pending_todo_reminders(db: AsyncSession) -> Sequence[TodoReminder]:

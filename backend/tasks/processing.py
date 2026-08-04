@@ -234,12 +234,52 @@ async def send_todo_reminder(reminder_id: str) -> None:
     logger.info("Todo reminder sent for {} (label={}).", reminder_id, reminder.label)
 
 
+_RECURRENCE_FREQUENCY_LABELS = {"daily": "每天", "weekly": "每週", "monthly": "每月"}
+
+
+async def send_recurring_todo_reminder(todo_id: str) -> None:
+    """Fires every time a recurring todo's CronTrigger goes off (see
+    backend/tasks/scheduler.py::schedule_recurring_todo). Unlike
+    send_todo_reminder, there's no TodoReminder row per fire — this is an
+    infinitely-repeating job keyed by the todo itself, so there's nothing to
+    mark "sent". Guard only checks "cancelled", not "done" — completing a
+    recurring todo does not stop future reminders, by design.
+    """
+    from backend.knowledge import crud
+    from backend.knowledge.db import async_session_maker
+
+    todo_uuid = uuid.UUID(todo_id)
+    async with async_session_maker() as db:
+        todo = await crud.get_todo(db, todo_uuid)
+        if todo is None or todo.status == "cancelled":
+            status = todo.status if todo else "missing"
+            logger.info("send_recurring_todo_reminder: todo {} is '{}', skipping.", todo_id, status)
+            return
+
+        label = _RECURRENCE_FREQUENCY_LABELS.get(todo.recurrence_frequency, "🔁")
+        todo_chat_id = settings.TELEGRAM_TODO_CHAT_ID or settings.TELEGRAM_CHAT_ID
+        keyboard = {
+            "inline_keyboard": [[
+                {"text": "🚫 停止提醒", "callback_data": f"remind:{todo_id}:stop_recurring"},
+            ]]
+        }
+        await _send_telegram(
+            f"🔁 週期提醒（{label}）：{todo.content}",
+            chat_id=todo_chat_id,
+            reply_markup=keyboard,
+        )
+    logger.info("Recurring todo reminder sent for {}.", todo_id)
+
+
 # ---------------------------------------------------------------------------
 # Notification helpers
 # ---------------------------------------------------------------------------
 
 async def _send_telegram(
-    text: str, chat_id: str | None = None, reply_markup: dict | None = None
+    text: str,
+    chat_id: str | None = None,
+    reply_markup: dict | None = None,
+    parse_mode: str | None = "Markdown",
 ) -> None:
     """Push *text* to *chat_id*, defaulting to TELEGRAM_CHAT_ID (the daily
     digest's destination) when not given explicitly.
@@ -249,6 +289,12 @@ async def _send_telegram(
     Telegram routes the resulting callback_query to this same bot regardless
     of which code path sent the original message (raw httpx here, not the
     python-telegram-bot Application), so handle_callback() still sees it.
+
+    *parse_mode* defaults to Markdown for callers with controlled, hand-
+    written text (e.g. the daily digest). Pass ``None`` when *text* embeds
+    arbitrary/untrusted content (e.g. another project's raw PROGRESS.md
+    text) — unbalanced `_`/`*`/backticks in that content would otherwise
+    make Telegram reject the whole message as an entity-parse error.
     """
     target = chat_id or settings.TELEGRAM_CHAT_ID
     if not settings.TELEGRAM_BOT_TOKEN or not target:
@@ -258,8 +304,9 @@ async def _send_telegram(
     payload = {
         "chat_id": target,
         "text": text[:4096],
-        "parse_mode": "Markdown",
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_markup is not None:
         payload["reply_markup"] = json.dumps(reply_markup)
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -267,7 +314,7 @@ async def _send_telegram(
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
         except httpx.HTTPError as exc:
-            logger.error("Telegram send failed: {}", exc)
+            logger.error("Telegram send failed: {} | text preview: {!r}", exc, text[:200])
 
 
 async def _send_email(subject: str, body: str) -> None:

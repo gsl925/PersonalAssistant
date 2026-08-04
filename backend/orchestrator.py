@@ -444,6 +444,19 @@ class Orchestrator:
         re.IGNORECASE,
     )
 
+    # Cheap pre-filter before ever calling the LLM for recurrence parsing —
+    # mirrors _TODO_CREATE_HINT_PATTERN's role. Deliberately narrow (requires
+    # "每" immediately before the unit) so a one-off reference like "下週三"
+    # never reaches _extract_recurrence in the first place; see the model
+    # comparison in the recurring-todo plan for why this matters more than
+    # picking a "smarter" model.
+    _RECURRENCE_HINT_PATTERN = re.compile(
+        r"每天|每日|每週|每周|每月|定期|週期|daily|weekly|monthly", re.IGNORECASE,
+    )
+    _RECURRENCE_WEEKDAY_MAP = {
+        "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+    }
+
     async def extract_todo_fields(self, text: str) -> dict:
         """Extract todo content + dates from free text via a fast_text LLM call.
 
@@ -520,6 +533,104 @@ class Orchestrator:
             "content": None, "start_date": None, "due_date": None,
         }
 
+    async def _extract_recurrence(self, text: str) -> dict | None:
+        """Detect + extract a periodic reminder rule from free text — e.g.
+        "每週一早上9點提醒我倒垃圾" → {"frequency": "weekly", "weekday": 0,
+        "day_of_month": None, "time": time(9, 0)}. Returns None if the text
+        doesn't look recurring at all (cheap regex gate, zero LLM cost) or
+        if the LLM's answer doesn't validate.
+
+        Deliberately a second, independent call from extract_todo_fields/
+        classify_todo_intent rather than folding a "recurrence" field into
+        their existing prompt — keeps those two prompts (already reliable in
+        production) untouched, and means the extra LLM call only happens for
+        the minority of messages that actually look periodic.
+
+        Uses the same "fast_text" tier as the rest of todo extraction —
+        tried upgrading to a bigger local model (qwen3.5:27b) for this
+        specifically since it needs more semantic judgment than plain date
+        arithmetic, but it timed out on every test call on this machine;
+        deepseek-r1:14b answered correctly but 3-4x slower for no benefit on
+        inputs that actually reach this function. qwen3:8b got every
+        gate-reachable test case right, so there's no reason to pay for a
+        bigger model here.
+        """
+        if not self._RECURRENCE_HINT_PATTERN.search(text):
+            return None
+
+        today = datetime.now(_TAIPEI).date().isoformat()
+        prompt = (
+            f"Today's date is {today} (Asia/Taipei). The message below might "
+            "describe a periodic/recurring reminder (e.g. every day, every "
+            "Monday, the 5th of every month) — or it might just be a one-off "
+            "task that happens to mention a day/date.\n\n"
+            f"Message:\n{text[:1000]}\n\n"
+            "Respond with ONLY valid JSON (no markdown fences):\n"
+            '{"frequency": "daily"|"weekly"|"monthly"|null, '
+            '"weekday": "mon"|"tue"|"wed"|"thu"|"fri"|"sat"|"sun"|null, '
+            '"day_of_month": <1-31 or null>, '
+            '"time": "<HH:MM 24hr, or null if no time mentioned>"}\n'
+            "If it's NOT actually recurring (e.g. a single specific date), "
+            "set frequency to null. If multiple days are mentioned, pick "
+            "only the first one."
+        )
+        try:
+            raw = await self.model_router.chat(
+                "fast_text", [{"role": "user", "content": prompt}], temperature=0,
+            )
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not match:
+                return None
+            data = json.loads(match.group())
+        except (AllProvidersFailedError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            logger.warning("Recurrence extraction failed: {}", exc)
+            return None
+
+        return self._validate_recurrence(data)
+
+    @classmethod
+    def _validate_recurrence(cls, data: dict) -> dict | None:
+        """Strict validation/normalization of a raw recurrence dict (from
+        either the LLM path above or the Dashboard's manual form) — never
+        trust frequency/weekday/day_of_month values outside the supported
+        set, same principle as _compute_reminders not trusting LLM date
+        arithmetic. Returns None if frequency isn't one of the three
+        supported values or a required sub-field is missing/out of range."""
+        frequency = data.get("frequency")
+        if frequency not in ("daily", "weekly", "monthly"):
+            return None
+
+        weekday = None
+        day_of_month = None
+        if frequency == "weekly":
+            weekday_raw = data.get("weekday")
+            weekday = (
+                cls._RECURRENCE_WEEKDAY_MAP.get(weekday_raw)
+                if isinstance(weekday_raw, str)
+                else weekday_raw if isinstance(weekday_raw, int) and 0 <= weekday_raw <= 6
+                else None
+            )
+            if weekday is None:
+                return None
+        elif frequency == "monthly":
+            day_of_month = data.get("day_of_month")
+            if not isinstance(day_of_month, int) or not (1 <= day_of_month <= 31):
+                return None
+
+        time_str = data.get("time")
+        remind_time = time(hour=_TODO_REMINDER_HOUR, minute=0)
+        if isinstance(time_str, str) and re.match(r"^\d{1,2}:\d{2}$", time_str):
+            hour, minute = (int(part) for part in time_str.split(":"))
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                remind_time = time(hour=hour, minute=minute)
+
+        return {
+            "frequency": frequency,
+            "weekday": weekday,
+            "day_of_month": day_of_month,
+            "time": remind_time,
+        }
+
     async def ask_claude(self, question: str) -> dict:
         """Explicit-intent one-off chat — Telegram's ``/ask`` command.
 
@@ -578,13 +689,50 @@ class Orchestrator:
         already known here, so this skips straight to extraction with no
         is_todo classification step."""
         fields = await self.extract_todo_fields(text)
+        recurrence = await self._extract_recurrence(text)
         return await self._persist_todo(
             content=fields["content"],
             source=source,
             raw_input=text,
             start_date=fields["start_date"],
             due_date=fields["due_date"],
+            recurrence=recurrence,
         )
+
+    async def create_recurring_todo(
+        self,
+        content: str,
+        source: str,
+        frequency: str,
+        weekday: int | None,
+        day_of_month: int | None,
+        time_str: str,
+    ) -> dict:
+        """Dashboard's manual "🔁 新增週期性提醒" form — structured fields
+        straight from a frequency dropdown, no LLM call at all (the user
+        already picked the exact rule, there's nothing to extract)."""
+        recurrence = self._validate_recurrence({
+            "frequency": frequency,
+            "weekday": weekday,
+            "day_of_month": day_of_month,
+            "time": time_str,
+        })
+        if recurrence is None:
+            return {"status": "failed", "message": "無效的週期規則"}
+        return await self._persist_todo(
+            content=content,
+            source=source,
+            raw_input=None,
+            start_date=None,
+            due_date=None,
+            recurrence=recurrence,
+        )
+
+    async def stop_recurring_todo(self, todo_id: str) -> dict:
+        """Used by the recurring reminder's "🚫 停止提醒" Telegram button —
+        sets status to "cancelled", the only thing that stops future fires
+        (see send_recurring_todo_reminder's status guard)."""
+        return await self.update_todo_status(todo_id, "cancelled")
 
     async def maybe_create_todo_from_message(self, text: str, source: str = "telegram") -> dict:
         """Ambient todo detection for free Telegram text.
@@ -601,6 +749,7 @@ class Orchestrator:
             return {"status": "not_todo"}
 
         confidence = classification["confidence"]
+        recurrence = await self._extract_recurrence(text)
         if confidence >= _AUTO_THRESHOLD:
             result = await self._persist_todo(
                 content=classification["content"],
@@ -608,6 +757,7 @@ class Orchestrator:
                 raw_input=text,
                 start_date=classification["start_date"],
                 due_date=classification["due_date"],
+                recurrence=recurrence,
             )
             result["status"] = "auto_created"
             return result
@@ -620,6 +770,7 @@ class Orchestrator:
                 "raw_input": text,
                 "start_date": classification["start_date"],
                 "due_date": classification["due_date"],
+                "recurrence": recurrence,
             }
             return {
                 "status": "pending_confirmation",
@@ -652,6 +803,7 @@ class Orchestrator:
             raw_input=pending["raw_input"],
             start_date=pending["start_date"],
             due_date=pending["due_date"],
+            recurrence=pending.get("recurrence"),
         )
         result["status"] = "auto_created"
         return result
@@ -671,6 +823,15 @@ class Orchestrator:
                 "due_date": t.due_date.isoformat() if t.due_date else None,
                 "source": t.source,
                 "source_url": t.source_url,
+                "recurrence": (
+                    {
+                        "frequency": t.recurrence_frequency,
+                        "weekday": t.recurrence_weekday,
+                        "day_of_month": t.recurrence_day_of_month,
+                        "time": t.recurrence_time.strftime("%H:%M"),
+                    }
+                    if t.recurrence_frequency else None
+                ),
                 "created_at": t.created_at,
                 "reminders": [
                     {"label": r.label, "remind_at": r.remind_at.astimezone(_TAIPEI).isoformat()}
@@ -781,9 +942,15 @@ class Orchestrator:
         raw_input: str | None,
         start_date: date | None,
         due_date: date | None,
+        recurrence: dict | None = None,
     ) -> dict:
-        reminders = self._compute_reminders(start_date, due_date)
+        """*recurrence*, if given, is the dict shape _validate_recurrence
+        returns: {"frequency", "weekday", "day_of_month", "time"}. A
+        recurring todo skips the one-off _compute_reminders/TodoReminder
+        machinery entirely — it gets a single ever-repeating CronTrigger job
+        instead (see _schedule_recurring)."""
         source_url = self._extract_url(raw_input) if raw_input else None
+        reminders = [] if recurrence else self._compute_reminders(start_date, due_date)
 
         async with self._session_maker() as db:
             todo = await crud.create_todo(
@@ -794,6 +961,10 @@ class Orchestrator:
                 source_url=source_url,
                 start_date=start_date,
                 due_date=due_date,
+                recurrence_frequency=recurrence["frequency"] if recurrence else None,
+                recurrence_weekday=recurrence["weekday"] if recurrence else None,
+                recurrence_day_of_month=recurrence["day_of_month"] if recurrence else None,
+                recurrence_time=recurrence["time"] if recurrence else None,
             )
             await db.flush()
             todo_id = todo.id
@@ -801,6 +972,8 @@ class Orchestrator:
             reminder_rows = await crud.create_todo_reminders(db, todo_id, reminders)
             await db.commit()
 
+        if recurrence:
+            self._schedule_recurring(str(todo_id), recurrence)
         for reminder in reminder_rows:
             self._schedule_reminder(str(reminder.id), reminder.remind_at)
 
@@ -813,6 +986,7 @@ class Orchestrator:
             "source_url": source_url,
             "start_date": start_date.isoformat() if start_date else None,
             "due_date": due_date.isoformat() if due_date else None,
+            "recurrence": self._recurrence_out(recurrence),
             "reminders": [
                 {"label": r.label, "remind_at": r.remind_at.isoformat()} for r in reminder_rows
             ],
@@ -820,9 +994,34 @@ class Orchestrator:
         }
 
     @staticmethod
+    def _recurrence_out(recurrence: dict | None) -> dict | None:
+        """Serialize a recurrence dict (internal `time` object) for API/JSON
+        responses — shared by _persist_todo and get_todos."""
+        if not recurrence:
+            return None
+        return {
+            "frequency": recurrence["frequency"],
+            "weekday": recurrence["weekday"],
+            "day_of_month": recurrence["day_of_month"],
+            "time": recurrence["time"].strftime("%H:%M"),
+        }
+
+    @staticmethod
     def _schedule_reminder(reminder_id: str, remind_at: datetime) -> None:
         from backend.tasks.scheduler import get_scheduler, schedule_todo_reminder
         schedule_todo_reminder(get_scheduler(), reminder_id, remind_at)
+
+    @staticmethod
+    def _schedule_recurring(todo_id: str, recurrence: dict) -> None:
+        from backend.tasks.scheduler import get_scheduler, schedule_recurring_todo
+        schedule_recurring_todo(
+            get_scheduler(),
+            todo_id,
+            recurrence["frequency"],
+            recurrence["weekday"],
+            recurrence["day_of_month"],
+            recurrence["time"],
+        )
 
     @staticmethod
     def _parse_date(value: Any) -> date | None:
@@ -983,6 +1182,7 @@ class Orchestrator:
                 "processing",
                 title=processed.title,
                 original_content=processed.original_content,
+                corrected_content=processed.corrected_content,
                 file_path=processed.file_path,
                 source_url=processed.source_url,
                 agent_used=agent_name,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 
 from sqlalchemy import (
     Boolean,
@@ -10,8 +10,10 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
+    Time,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -48,6 +50,11 @@ class Document(Base):
         String(50), nullable=True, index=True
     )
     original_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # LLM pass over a whisper transcript that fixes likely ASR homophone
+    # errors — kept separate from original_content (never overwritten) so
+    # the unmodified transcript stays available to check the correction
+    # against. NULL for anything that wasn't whisper-transcribed.
+    corrected_content: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     agent_used: Mapped[str | None] = mapped_column(String(50), nullable=True)
@@ -237,6 +244,21 @@ class Todo(Base):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="pending", index=True
     )  # pending / done / cancelled
+    # Periodic reminder rule — independent of start_date/due_date, which stay
+    # None for a recurring todo. NULL frequency means "not recurring" (the
+    # existing one-off TodoReminder-based behavior, untouched). "done" does
+    # NOT stop future recurring reminders (by design); only "cancelled" does
+    # — see send_recurring_todo_reminder's status guard.
+    recurrence_frequency: Mapped[str | None] = mapped_column(
+        String(10), nullable=True
+    )  # daily / weekly / monthly / NULL
+    recurrence_weekday: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )  # 0=Mon..6=Sun, only for weekly
+    recurrence_day_of_month: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )  # 1-31, only for monthly
+    recurrence_time: Mapped[time | None] = mapped_column(Time, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )

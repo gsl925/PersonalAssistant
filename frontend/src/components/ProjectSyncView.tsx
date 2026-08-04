@@ -9,6 +9,13 @@ export default function ProjectSyncView() {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [sending, setSending] = useState<Record<string, boolean>>({});
   const [msgs, setMsgs] = useState<Record<string, string>>({});
+  const [newPath, setNewPath] = useState("");
+  const [newLabel, setNewLabel] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [addMsg, setAddMsg] = useState("");
+  const [broadcastText, setBroadcastText] = useState("");
+  const [broadcasting, setBroadcasting] = useState(false);
+  const [broadcastMsg, setBroadcastMsg] = useState("");
 
   function load() {
     setLoading(true);
@@ -37,6 +44,44 @@ export default function ProjectSyncView() {
     }
   }
 
+  async function broadcast() {
+    const trimmed = broadcastText.trim();
+    if (!trimmed) return;
+    setBroadcasting(true);
+    setBroadcastMsg("");
+    try {
+      const res = await api.broadcastInstruction(trimmed);
+      const parts: string[] = [];
+      if (res.succeeded.length) parts.push(`✓ 已寫入：${res.succeeded.join("、")}`);
+      if (res.failed.length) parts.push(`✗ 沒有 PROGRESS.md，略過：${res.failed.join("、")}`);
+      setBroadcastMsg(parts.join(" ") || "沒有追蹤中的專案。");
+      setBroadcastText("");
+    } catch (err) {
+      setBroadcastMsg(err instanceof Error ? `✗ ${err.message}` : "✗ 發生錯誤");
+    } finally {
+      setBroadcasting(false);
+    }
+  }
+
+  async function addProject() {
+    const label = newLabel.trim();
+    const repoPath = newPath.trim();
+    if (!label || !repoPath) return;
+    setAdding(true);
+    setAddMsg("");
+    try {
+      const res = await api.addTrackedProject(label, repoPath);
+      setAddMsg(`🆕 開始設定「${res.label}」，完成後會出現在下方清單並開始同步。`);
+      setNewLabel("");
+      setNewPath("");
+      load();
+    } catch (err) {
+      setAddMsg(err instanceof Error ? `✗ ${err.message}` : "✗ 發生錯誤");
+    } finally {
+      setAdding(false);
+    }
+  }
+
   async function remove(projectName: string) {
     try {
       await api.deleteTrackedProject(projectName);
@@ -53,6 +98,53 @@ export default function ProjectSyncView() {
       <p className="muted" style={{ fontSize: 12 }}>
         目前追蹤的 Repo，跟 PROGRESS.md 郵差機制同步——這裡的回覆跟 Telegram 回覆效果完全一樣。
       </p>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>➕ 新增追蹤專案</div>
+        <div className="filter-bar" style={{ marginBottom: 6 }}>
+          <input
+            type="text"
+            placeholder="Repo 路徑，例如 D:/_SideProject/Foo"
+            value={newPath}
+            onChange={(e) => setNewPath(e.target.value)}
+            style={{ flex: 1 }}
+          />
+          <input
+            type="text"
+            placeholder="名稱，例如 Foo 專案"
+            value={newLabel}
+            onChange={(e) => setNewLabel(e.target.value)}
+            style={{ flex: 1 }}
+          />
+          <button className="primary" onClick={addProject} disabled={adding}>
+            {adding ? "設定中…" : "新增"}
+          </button>
+        </div>
+        {addMsg && <p className="muted" style={{ fontSize: 12 }}>{addMsg}</p>}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>📢 廣播指令給所有專案</div>
+        <p className="muted" style={{ fontSize: 12, marginTop: 0, marginBottom: 6 }}>
+          寫進每個專案的「📮 你的指示」——純寫檔，不會觸發任何 session，各專案自己判斷什麼時候處理。
+        </p>
+        <div className="filter-bar" style={{ marginBottom: 6 }}>
+          <input
+            type="text"
+            placeholder="例如：明天休息一天，不用跑排程"
+            value={broadcastText}
+            onChange={(e) => setBroadcastText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") broadcast();
+            }}
+            style={{ flex: 1 }}
+          />
+          <button className="primary" onClick={broadcast} disabled={broadcasting}>
+            {broadcasting ? "送出中…" : "廣播"}
+          </button>
+        </div>
+        {broadcastMsg && <p className="muted" style={{ fontSize: 12 }}>{broadcastMsg}</p>}
+      </div>
 
       {items.map((project) => (
         <div className="card" key={project.name} style={{ marginBottom: 14 }}>

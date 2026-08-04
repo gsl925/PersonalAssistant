@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -91,13 +92,22 @@ async def _send_relay(text: str) -> None:
     broadcast-only TELEGRAM_CHAT_ID digest channel that _send_telegram()
     defaults to. Falls back to that channel if the bot isn't up yet (e.g.
     this runs as a background task that can fire before the bot finishes
-    starting) or TELEGRAM_BOT_TOKEN isn't configured at all."""
+    starting) or TELEGRAM_BOT_TOKEN isn't configured at all.
+
+    Always sent as plain text (parse_mode=None) — *text* embeds another
+    project's raw PROGRESS.md content (file paths, env var names, trigger
+    ids, ...), which regularly contains unbalanced `_`/`*`/backtick
+    characters. With Markdown parsing on, Telegram rejects those as an
+    entity-parse error and the send raises *every* cycle forever with no
+    visible symptom other than the item never arriving — exactly what
+    happened here before this fix.
+    """
     try:
         from backend.main import get_telegram_bot
 
-        await get_telegram_bot().send_message(text)
+        await get_telegram_bot().send_message(text, parse_mode=None)
     except RuntimeError:
-        await _send_telegram(text)
+        await _send_telegram(text, parse_mode=None)
 
 
 def _split_sections(text: str) -> dict[str, str]:
@@ -197,8 +207,15 @@ async def _relay_discuss_items(project: TrackedProject, full_text: str, pstate: 
         if bullet["checked"] or bullet["content"] in already_tracked:
             continue
         number = pstate["next_item_number"]
+        try:
+            await _send_relay(f"💬 [{project.label}] #{number} 需要你決定：{bullet['content']}\n\n#{project.name}")
+        except Exception as exc:
+            # Don't burn this item's number or mark it tracked — leave it
+            # for a retry next cycle — and don't let one bad bullet stop the
+            # rest of this project's bullets from being relayed this cycle.
+            logger.error("Failed to relay 💬 item #{} for {}: {}", number, project.name, exc)
+            continue
         pstate["next_item_number"] = number + 1
-        await _send_relay(f"💬 [{project.label}] #{number} 需要你決定：{bullet['content']}\n\n#{project.name}")
         pstate["awaiting_decision"].append(
             {
                 "number": number,
@@ -215,9 +232,16 @@ async def _maybe_relay_report(project: TrackedProject, full_text: str, pstate: d
     updated_at = _extract_updated_at(sections[_REPORT_HEADER])
     if not updated_at or updated_at == pstate.get("last_report_time"):
         return
-    await _send_relay(
-        f"📋 [{project.label}] 進度更新\n\n{sections[_REPORT_HEADER]}\n\n#{project.name}"
-    )
+    try:
+        await _send_relay(
+            f"📋 [{project.label}] 進度更新\n\n{sections[_REPORT_HEADER]}\n\n#{project.name}"
+        )
+    except Exception as exc:
+        # Leave last_report_time unset so this same report retries next
+        # cycle, but don't let the failure stop escalate/wake from running
+        # for this project this cycle.
+        logger.error("Failed to relay report update for {}: {}", project.name, exc)
+        return
     pstate["last_report_time"] = updated_at
 
 
@@ -295,16 +319,23 @@ async def _maybe_wake_project(project: TrackedProject, full_text: str, pstate: d
     pstate["last_wake_cycle"] = pstate["cycle"]  # set before await — avoid duplicate triggers
     logger.info("Auto-waking {} — {} pending instruction(s), oldest age {} cycle(s).",
                 project.name, len(tracked), oldest_age)
-    await _send_relay(f"🔔 已喚醒「{project.label}」處理待處理指示，稍後會回報結果。\n\n#{project.name}")
+    try:
+        await _send_relay(
+            f"🔔 已通知「{project.label}」去檢查待處理指示，實際結果請看它的 PROGRESS.md。\n\n#{project.name}"
+        )
+    except Exception as exc:
+        # The notification is a courtesy, not the action itself — don't let
+        # it failing skip the actual wake below.
+        logger.error("Failed to relay wake notification for {}: {}", project.name, exc)
 
     async def _run_wake() -> None:
         from backend.tasks.claude_wake import wake_project
 
         result = await wake_project(project.repo_path)
         if result["ok"]:
-            logger.info("Auto-wake completed for {}.", project.name)
+            logger.info("Auto-wake session finished for {}.", project.name)
         else:
-            await _send_relay(f"❌ 喚醒「{project.label}」失敗：{result['error']}\n\n#{project.name}")
+            await _send_relay(f"❌ 通知「{project.label}」失敗：{result['error']}\n\n#{project.name}")
 
     asyncio.create_task(_run_wake())
 
@@ -323,6 +354,18 @@ async def wake_now(project_name: str) -> dict:
     and unconditionally on request, for ANY tracked project regardless of
     its `auto_wake` setting — the opt-in flag exists to gate *unattended*
     execution, not a user's own explicit, in-the-moment ask.
+
+    This is a pure *notification* trigger, not a supervised task run: the
+    caller gets an immediate ack (see handle_wake_command) and PA does not
+    wait on, time-box for reporting purposes, or claim to know the outcome
+    of the triggered session — that would mean either killing genuinely
+    long-running work partway through to make a deadline, or babysitting a
+    task PA has no way to judge "done" from the outside anyway. The actual
+    result always surfaces through the target's own PROGRESS.md (checked
+    boxes, updated report), same as any other instruction — this just makes
+    the target look *now* instead of waiting for its own cadence. A relay
+    message only goes out if the session itself failed to run at all (a
+    real operational problem, not "still working").
     """
     project = next((p for p in load_tracked_projects() if p.name == project_name), None)
     if project is None:
@@ -340,9 +383,9 @@ async def wake_now(project_name: str) -> dict:
         try:
             result = await wake_project(project.repo_path)
             if result["ok"]:
-                await _send_relay(f"✅ 「{project.label}」處理完成。\n\n#{project.name}")
+                logger.info("wake_now session finished for {}.", project_name)
             else:
-                await _send_relay(f"❌ 喚醒「{project.label}」失敗：{result['error']}\n\n#{project.name}")
+                await _send_relay(f"❌ 通知「{project.label}」失敗：{result['error']}\n\n#{project.name}")
         finally:
             _wake_in_flight.discard(project_name)
 
@@ -416,6 +459,73 @@ async def write_instruction(project_name: str, text: str) -> bool:
     path.write_text(full_text, encoding="utf-8")
     _write_state(state)
     return True
+
+
+def _slugify(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")
+
+
+async def add_project(label: str, repo_path: str) -> dict:
+    """Onboard a brand-new tracked project — the Dashboard's "新增專案" form
+    and Telegram's `/newproject` command both call this.
+
+    Copies SDD_PROGRESS_SYNC.md into the target repo, registers it in
+    projects.yaml, then fires a one-off headless claude call
+    (claude_wake.bootstrap_project) so *that* project's own Claude Code
+    session sets up its PROGRESS.md/CLAUDE.md per the SDD — PA never writes
+    those files itself, same "mailman, not executor" boundary as
+    wake_now(), just for onboarding instead of an ongoing mailbox check.
+
+    *repo_path* doesn't need to already exist — a genuinely brand-new
+    project usually means a folder that hasn't been created yet, so a
+    missing path is created (parents included) rather than rejected.
+    "path_not_found" now only fires for the (invalid) case where the path
+    exists but isn't a directory, e.g. a file of that name is in the way.
+    """
+    from backend.config import add_tracked_project
+
+    repo = Path(repo_path)
+    if repo.exists() and not repo.is_dir():
+        return {"status": "path_not_found"}
+    repo.mkdir(parents=True, exist_ok=True)
+
+    # Prefer a slug of the label; fall back to the folder name for
+    # all-CJK labels that slugify to nothing (only [a-z0-9-] survives).
+    name = _slugify(label) or _slugify(repo.name) or "project"
+    if not add_tracked_project(name, label, str(repo)):
+        return {"status": "already_exists", "name": name}
+
+    sdd_src = settings.BASE_DIR / "SDD_PROGRESS_SYNC.md"
+    shutil.copy(sdd_src, repo / "SDD_PROGRESS_SYNC.md")
+
+    await _send_relay(f"🆕 開始設定「{label}」…\n\n#{name}")
+
+    async def _run() -> None:
+        from backend.tasks.claude_wake import bootstrap_project
+
+        result = await bootstrap_project(str(repo))
+        if result["ok"]:
+            await _send_relay(f"✅ 「{label}」設定完成，已開始追蹤。\n\n#{name}")
+        else:
+            await _send_relay(f"❌ 「{label}」設定失敗：{result['error']}\n\n#{name}")
+
+    asyncio.create_task(_run())
+    return {"status": "started", "name": name, "label": label}
+
+
+async def broadcast_instruction(text: str) -> dict:
+    """Write the same instruction into every tracked project's "📮 你的指示"
+    at once — a bulk version of write_instruction(), still pure file I/O
+    with no execution triggered (same mailman boundary as everything else
+    in this module). Projects with no PROGRESS.md yet are skipped and
+    reported, not treated as a batch failure.
+    """
+    succeeded = []
+    failed = []
+    for project in load_tracked_projects():
+        ok = await write_instruction(project.name, text)
+        (succeeded if ok else failed).append(project.label)
+    return {"succeeded": succeeded, "failed": failed}
 
 
 def remove_project(project_name: str) -> bool:

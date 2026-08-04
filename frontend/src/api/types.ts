@@ -36,6 +36,7 @@ export interface DocumentContent {
   id: string;
   title: string | null;
   original_content: string | null;
+  corrected_content: string | null;
   type_specific_data: Record<string, unknown> | null;
 }
 
@@ -115,6 +116,13 @@ export interface TodoReminder {
   remind_at: string;
 }
 
+export interface TodoRecurrence {
+  frequency: string; // daily / weekly / monthly
+  weekday: number | null; // 0=Mon..6=Sun, only for weekly
+  day_of_month: number | null; // 1-31, only for monthly
+  time: string; // "HH:MM"
+}
+
 export interface Todo {
   id: string;
   content: string;
@@ -123,6 +131,7 @@ export interface Todo {
   due_date: string | null;
   source: string;
   source_url: string | null;
+  recurrence?: TodoRecurrence | null;
   created_at: string;
   reminders?: TodoReminder[] | null;
 }
@@ -161,6 +170,17 @@ export interface TrackedProjectOut {
 
 export interface TrackedProjectListResponse {
   items: TrackedProjectOut[];
+}
+
+export interface AddTrackedProjectResponse {
+  status: string;
+  name?: string;
+  label?: string;
+}
+
+export interface BroadcastInstructionResponse {
+  succeeded: string[];
+  failed: string[];
 }
 
 // --- settings.py ---

@@ -206,6 +206,30 @@ def load_tracked_projects() -> list[TrackedProject]:
     return [p for p in projects if p.enabled]
 
 
+def add_tracked_project(name: str, label: str, repo_path: str, auto_wake: bool = False) -> bool:
+    """Append a new project entry to projects.yaml. Returns False if `name`
+    already belongs to an existing entry (checked against every entry, not
+    just enabled ones, so re-adding a disabled project's slug still
+    collides). Used to onboard a brand-new tracked project — see
+    project_sync.add_project().
+    """
+    path = settings.PROJECTS_YAML_PATH
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception as exc:
+        logger.error("Failed to parse {}: {}", path, exc)
+        data = {}
+    data = data or {}
+    entries = data.setdefault("projects", [])
+    if any(e.get("name") == name for e in entries):
+        return False
+    entries.append(
+        {"name": name, "label": label, "repo_path": repo_path, "enabled": True, "auto_wake": auto_wake}
+    )
+    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return True
+
+
 def remove_tracked_project(name: str) -> bool:
     """Remove a project entry from projects.yaml by its `name` slug.
 

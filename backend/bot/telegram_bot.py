@@ -119,6 +119,8 @@ class PersonalAssistantBot:
         add(CommandHandler("ask", self.handle_ask_command))
         add(CommandHandler("wake", self.handle_wake_command))
         add(CommandHandler("projects", self.handle_projects_command))
+        add(CommandHandler("newproject", self.handle_newproject_command))
+        add(CommandHandler("broadcast", self.handle_broadcast_command))
 
         # Specific media types — registered before the broad TEXT filter.
         add(MessageHandler(filters.PHOTO, self.handle_photo))
@@ -226,29 +228,72 @@ class PersonalAssistantBot:
     async def handle_wake_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """On-demand ``/wake <project-slug>`` — immediately fires the same
-        headless "check your mailbox" call project_sync.py's staleness
-        detector uses, for any tracked project regardless of its
-        `auto_wake` setting (an explicit ask carries its own consent).
-        See project_sync.wake_now()."""
+        """On-demand ``/wake <project-slug>`` — DISABLED 2026-07-31, pending
+        redesign. It only ever accomplishes "spin up a brand-new, one-shot
+        local session with full edit/Bash rights right now" — there's no
+        lighter "just nudge an already-scheduled thing" mechanism available
+        (confirmed via RemoteTrigger: no cloud Routine exists for checking
+        PROGRESS.md, and cloud Routines couldn't reach it anyway since
+        PROGRESS.md is deliberately gitignored/local-only). That gap between
+        what the user wanted (accelerate an existing watcher) and what this
+        can actually do (create a new one-shot session each time) is being
+        revisited before re-enabling. See project_sync.wake_now() — the
+        underlying implementation is untouched, just not wired up here.
+        """
         self._cache_chat_id(update)
-        project_name = " ".join(context.args or []).strip().lower()
-        if not project_name:
-            await update.message.reply_text("用法：/wake 專案代稱，例如 /wake genai-news")
+        await update.message.reply_text("🚧 /wake 目前暫停使用，設計還在討論中。")
+
+    async def handle_newproject_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """``/newproject <repo路徑> <名稱>`` — onboard a brand-new tracked
+        project (see project_sync.add_project). The path is a local folder
+        on this machine, so this realistically gets typed from the
+        Dashboard's form more often than from Telegram, but kept here for
+        parity with the other project-sync commands."""
+        self._cache_chat_id(update)
+        args = context.args or []
+        if len(args) < 2:
+            await update.message.reply_text(
+                "用法：/newproject repo路徑 名稱，例如 /newproject D:/_SideProject/Foo Foo專案"
+            )
+            return
+        repo_path, label = args[0], " ".join(args[1:])
+
+        from backend.tasks.project_sync import add_project
+
+        result = await add_project(label, repo_path)
+        result_status = result["status"]
+        if result_status == "path_not_found":
+            await update.message.reply_text(f"❌ 「{repo_path}」已存在但不是資料夾。")
+        elif result_status == "already_exists":
+            await update.message.reply_text(f"❌ 「{result['name']}」已經在追蹤中了。")
+        elif result_status == "started":
+            await update.message.reply_text(f"🆕 開始設定「{label}」，完成後會回報結果。")
+
+    async def handle_broadcast_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """``/broadcast <text>`` — writes *text* into every tracked
+        project's "📮 你的指示" at once. Pure file write, same as replying
+        with a single project's hashtag — this does NOT trigger any
+        session/execution, it just queues the same instruction everywhere
+        for each project to pick up on its own terms."""
+        self._cache_chat_id(update)
+        text = " ".join(context.args or []).strip()
+        if not text:
+            await update.message.reply_text("用法：/broadcast 要廣播的指令內容")
             return
 
-        from backend.tasks.project_sync import wake_now
+        from backend.tasks.project_sync import broadcast_instruction
 
-        result = await wake_now(project_name)
-        status = result["status"]
-        if status == "started":
-            await update.message.reply_text(f"🔔 已喚醒「{result['label']}」，處理中，完成後會回報結果。")
-        elif status == "not_found":
-            await update.message.reply_text(f"❌ 找不到專案「{project_name}」，用 /projects 查看正確代稱。")
-        elif status == "no_progress_file":
-            await update.message.reply_text(f"❌ 「{project_name}」還沒有 PROGRESS.md，無法喚醒。")
-        elif status == "already_running":
-            await update.message.reply_text(f"⏳ 「{project_name}」目前已經在處理中，請等它跑完再試一次。")
+        result = await broadcast_instruction(text)
+        lines = []
+        if result["succeeded"]:
+            lines.append(f"✅ 已寫入：{'、'.join(result['succeeded'])}")
+        if result["failed"]:
+            lines.append(f"❌ 沒有 PROGRESS.md，略過：{'、'.join(result['failed'])}")
+        await update.message.reply_text("\n".join(lines) or "沒有追蹤中的專案。")
 
     async def handle_projects_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -547,6 +592,12 @@ class PersonalAssistantBot:
                         await query.edit_message_text(f"😴 已延後，將於 {when} 再提醒：{result['content']}")
                     else:
                         await query.edit_message_text(f"❌ {result.get('message', '發生錯誤')}")
+                elif payload == "stop_recurring":
+                    result = await self.orchestrator.stop_recurring_todo(doc_id)
+                    if result.get("status") == "completed":
+                        await query.edit_message_text(f"🚫 已停止週期提醒：{result['content']}")
+                    else:
+                        await query.edit_message_text(f"❌ {result.get('message', '發生錯誤')}")
                 else:
                     await query.edit_message_text("❓ 無效的操作。")
             except Exception as exc:
@@ -618,11 +669,24 @@ class PersonalAssistantBot:
                 "(set TELEGRAM_CHAT_ID in settings or send a /start message first)."
             )
             return
-        await self.app.bot.send_message(
-            chat_id=chat_id,
-            text=text[:4096],
-            parse_mode=parse_mode,
-        )
+        try:
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=text[:4096],
+                parse_mode=parse_mode,
+            )
+        except Exception as exc:
+            # Callers (e.g. project_sync's relay) rely on this raising to
+            # know the send didn't go through — but log the failure with a
+            # text preview first, since an uncaught exception here otherwise
+            # vanishes into whatever swallows it upstream with no trace of
+            # *why* (a common cause: parse_mode=Markdown choking on raw
+            # underscores/backticks in dynamic text).
+            logger.error(
+                "Telegram send_message failed (chat_id={}, parse_mode={}): {} | text preview: {!r}",
+                chat_id, parse_mode, exc, text[:200],
+            )
+            raise
 
     async def send_confirmation_request(
         self,
@@ -718,8 +782,9 @@ class PersonalAssistantBot:
             BotCommand("status", "查看系統狀態"),
             BotCommand("todo", "新增一筆代辦，例如 /todo 記得繳電費 8/5 前"),
             BotCommand("ask", "問 Claude 一個跟專案無關的問題，例如 /ask 台北明天天氣如何"),
-            BotCommand("wake", "立刻喚醒某個追蹤中的專案去處理 PROGRESS.md，例如 /wake genai-news"),
             BotCommand("projects", "查看目前追蹤的專案與待決策項目"),
+            BotCommand("newproject", "新增一個追蹤中的專案，例如 /newproject D:/path/to/repo 專案名稱"),
+            BotCommand("broadcast", "把同一段指令寫進所有追蹤中專案的 PROGRESS.md，例如 /broadcast 明天休息一天"),
         ])
         await self.app.start()
         await self.app.updater.start_polling(drop_pending_updates=True)
