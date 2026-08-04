@@ -14,7 +14,8 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import CouldNotRetrieveTranscript
 
 from backend.adapters.base import BaseAdapter, ProcessedContent
-from backend.adapters.whisper_utils import transcribe_audio
+from backend.adapters.transcript_correction import correct_transcript
+from backend.adapters.whisper_utils import _S2TWP, transcribe_audio
 
 _FETCH_TIMEOUT = 30.0
 _INVESTMENT_PATTERNS = re.compile(
@@ -36,12 +37,14 @@ class WebclipAdapter(BaseAdapter):
 
         if video_id:
             transcript = await self._fetch_youtube_transcript(video_id)
+            used_whisper = False
             if not transcript:
                 logger.info(
                     "No captions for YouTube video {} — falling back to whisper transcription.",
                     video_id,
                 )
                 transcript = await self._transcribe_youtube_audio(video_id)
+                used_whisper = True
                 if not transcript:
                     logger.warning(
                         "Whisper transcription also failed for {} — falling back to page scrape.",
@@ -51,10 +54,15 @@ class WebclipAdapter(BaseAdapter):
             if transcript:
                 _, title = await self._fetch_page(url)
                 content_type = self._detect_content_type(url, transcript)
+                # Official captions are text, not ASR output — nothing to
+                # correct. Only whisper's fallback transcription goes
+                # through the correction pass (see transcript_correction.py).
+                corrected = await correct_transcript(self.model_router, transcript) if used_whisper else None
                 return ProcessedContent(
                     source_type=self.source_type,
                     title=title or urlparse(url).netloc,
                     original_content=transcript,
+                    corrected_content=corrected,
                     source_url=url,
                     metadata={
                         "content_type": content_type,
@@ -107,7 +115,12 @@ class WebclipAdapter(BaseAdapter):
             logger.warning("Unexpected error fetching transcript for {}: {}", video_id, exc)
             return None
 
-        return " ".join(snippet.text for snippet in fetched).strip() or None
+        text = " ".join(snippet.text for snippet in fetched).strip()
+        # YouTube's own (auto-generated or uploaded) caption tracks skew
+        # Simplified for Chinese the same way whisper does — see
+        # whisper_utils._S2TWP. Applying it here too so this path isn't
+        # silently exempt from the same conversion.
+        return _S2TWP.convert(text) if text else None
 
     async def _transcribe_youtube_audio(self, video_id: str) -> str | None:
         """Fallback for videos with no captions: download the audio via

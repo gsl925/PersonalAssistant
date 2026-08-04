@@ -10,8 +10,16 @@ import asyncio
 from pathlib import Path
 
 from loguru import logger
+from opencc import OpenCC
 
-WHISPER_MODEL_SIZE = "base"  # use "small" or "medium" for better accuracy
+WHISPER_MODEL_SIZE = "medium"  # was "base" — trading CPU inference time for accuracy
+
+# Whisper's Chinese training data skews Simplified, so it transcribes
+# Mandarin speech into Simplified characters regardless of accent/region —
+# s2twp additionally swaps Mainland/Taiwan terminology (軟件→軟體, 程序→程式),
+# not just character shapes. Built once and reused; running it on non-Chinese
+# text is a harmless no-op.
+_S2TWP = OpenCC("s2twp")
 
 
 async def transcribe_audio(media_path: Path) -> str:
@@ -35,7 +43,8 @@ async def transcribe_audio(media_path: Path) -> str:
                 info.language,
                 info.language_probability,
             )
-            return " ".join(seg.text.strip() for seg in segments)
+            text = " ".join(seg.text.strip() for seg in segments)
+            return _S2TWP.convert(text)
         except Exception as exc:
             logger.error("Whisper transcription failed: {}", exc)
             return f"[Transcription failed: {exc}]"

@@ -73,6 +73,7 @@ class DocumentContentOut(BaseModel):
     id: uuid.UUID
     title: str | None = None
     original_content: str | None = None
+    corrected_content: str | None = None
     type_specific_data: dict[str, Any] | None = None
 
     model_config = {"from_attributes": True}
@@ -279,6 +280,7 @@ async def get_document_content(
         id=doc.id,
         title=doc.title,
         original_content=doc.original_content,
+        corrected_content=doc.corrected_content,
         type_specific_data=doc.type_specific_data,
     )
 

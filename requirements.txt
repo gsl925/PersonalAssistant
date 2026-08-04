@@ -46,6 +46,7 @@ youtube-transcript-api>=1.0.0
 # --- Speech-to-Text (CPU-compatible) ---
 faster-whisper>=1.0.0
 yt-dlp>=2024.7.1  # audio download fallback for caption-less YouTube videos
+opencc-python-reimplemented>=0.1.7  # Simplified->Traditional (Taiwan) conversion for whisper output
 
 # --- Config & Environment ---
 python-dotenv>=1.0.0

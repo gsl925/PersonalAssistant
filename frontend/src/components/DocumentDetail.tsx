@@ -84,6 +84,32 @@ export default function DocumentDetail({
           </button>
         )}
 
+        {content?.corrected_content && (
+          <>
+            <h3 style={{ fontSize: 13, margin: "10px 0 4px" }}>
+              LLM 校正版{" "}
+              <span className="muted" style={{ fontWeight: 400, fontSize: 11 }}>
+                （實驗性，可能改錯，請對照原始內容核實）
+              </span>
+            </h3>
+            <pre
+              style={{
+                whiteSpace: "pre-wrap",
+                fontSize: 12.5,
+                lineHeight: 1.6,
+                maxHeight: 300,
+                overflowY: "auto",
+                background: "var(--bg)",
+                padding: 10,
+                borderRadius: 6,
+                border: "1px solid var(--border)",
+              }}
+            >
+              {content.corrected_content}
+            </pre>
+          </>
+        )}
+
         <h3 style={{ fontSize: 13, margin: "10px 0 4px" }}>原始內容</h3>
         {loading ? (
           <p className="muted">載入中…</p>

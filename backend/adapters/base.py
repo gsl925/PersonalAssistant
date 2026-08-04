@@ -22,6 +22,9 @@ class ProcessedContent:
     file_path: str | None = None
     source_url: str | None = None
     metadata: dict = field(default_factory=dict)
+    # LLM-corrected version of original_content, set only when original_content
+    # came from whisper — see backend/adapters/transcript_correction.py.
+    corrected_content: str | None = None
 
 
 class BaseAdapter(ABC):
