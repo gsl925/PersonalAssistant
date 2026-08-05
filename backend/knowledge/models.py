@@ -62,6 +62,14 @@ class Document(Base):
     # summaries, meeting attendees/decisions) that don't map onto the generic
     # summary/category columns above.
     type_specific_data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # LLM-extracted "what is the author actually arguing" — distinct from
+    # `summary` (which is content-restatement-oriented, from webclip-agent's
+    # own prompt). Populated by backend/insight.py::extract_insight(), only
+    # for documents saved through the insight-preview flow.
+    ai_insight: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The user's own personal annotation/reaction to this document — never
+    # written by an LLM, only ever set directly via the "add my insight" UI.
+    user_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     processing_status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="pending", index=True
     )  # pending / processing / completed / failed

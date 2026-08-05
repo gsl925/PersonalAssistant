@@ -25,11 +25,34 @@ export interface Document {
   file_path: string | null;
   source_url: string | null;
   agent_used: string | null;
+  ai_insight: string | null;
+  user_note: string | null;
   processing_status: ProcessingStatus | string;
   created_at: string;
   updated_at: string | null;
   tags: Tag[];
   projects: Project[];
+}
+
+export interface InsightPreview {
+  status: string;
+  preview_id: string | null;
+  title: string | null;
+  insight: string | null;
+  source_url: string | null;
+  is_video: boolean | null;
+  message: string | null;
+}
+
+export interface SaveInsightResponse {
+  status: string;
+  doc_id: string | null;
+  message: string | null;
+  title: string | null;
+  summary: string | null;
+  category: string | null;
+  tags: string[] | null;
+  ai_insight: string | null;
 }
 
 export interface DocumentContent {

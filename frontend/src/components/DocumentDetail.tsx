@@ -16,6 +16,9 @@ export default function DocumentDetail({
   const [content, setContent] = useState<DocumentContent | null>(null);
   const [loading, setLoading] = useState(true);
   const [retrying, setRetrying] = useState(false);
+  const [note, setNote] = useState(doc.user_note ?? "");
+  const [savingNote, setSavingNote] = useState(false);
+  const [noteMsg, setNoteMsg] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -40,6 +43,20 @@ export default function DocumentDetail({
       onRetried?.();
     } finally {
       setRetrying(false);
+    }
+  }
+
+  async function handleSaveNote() {
+    setSavingNote(true);
+    setNoteMsg("");
+    try {
+      await api.setUserNote(doc.id, note);
+      setNoteMsg("✓ 已儲存");
+      onRetried?.();
+    } catch (err) {
+      setNoteMsg(err instanceof Error ? `✗ ${err.message}` : "✗ 發生錯誤");
+    } finally {
+      setSavingNote(false);
     }
   }
 
@@ -70,6 +87,13 @@ export default function DocumentDetail({
           </>
         )}
 
+        {doc.ai_insight && (
+          <>
+            <h3 style={{ fontSize: 13, margin: "10px 0 4px" }}>💡 核心洞察</h3>
+            <p style={{ fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{doc.ai_insight}</p>
+          </>
+        )}
+
         <div style={{ margin: "8px 0" }}>
           {doc.tags.map((t) => (
             <span className="tag" key={t.keyword}>
@@ -83,6 +107,34 @@ export default function DocumentDetail({
             {retrying ? "重試中…" : "重新處理"}
           </button>
         )}
+
+        <h3 style={{ fontSize: 13, margin: "10px 0 4px" }}>📝 我的洞察</h3>
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="寫下你自己對這篇內容的看法或註記…"
+          style={{
+            width: "100%",
+            minHeight: 60,
+            fontSize: 13,
+            padding: 8,
+            borderRadius: 6,
+            border: "1px solid var(--border)",
+            background: "var(--bg)",
+            color: "inherit",
+            resize: "vertical",
+          }}
+        />
+        <div style={{ marginTop: 6, marginBottom: 10 }}>
+          <button onClick={handleSaveNote} disabled={savingNote}>
+            {savingNote ? "儲存中…" : "儲存我的洞察"}
+          </button>
+          {noteMsg && (
+            <span className="muted" style={{ fontSize: 12, marginLeft: 8 }}>
+              {noteMsg}
+            </span>
+          )}
+        </div>
 
         {content?.corrected_content && (
           <>

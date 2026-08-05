@@ -5,6 +5,9 @@ contextBridge.exposeInMainWorld("api", {
   ingestUrl: (url) => ipcRenderer.invoke("ingest-url", url),
   ingestFilePath: (filePath) => ipcRenderer.invoke("ingest-file-path", filePath),
   createTodo: (text) => ipcRenderer.invoke("create-todo", text),
+  previewInsight: (url) => ipcRenderer.invoke("preview-insight", url),
+  saveInsightPreview: (previewId) => ipcRenderer.invoke("save-insight-preview", previewId),
+  onClipboardText: (cb) => ipcRenderer.on("clipboard-text", (_event, text) => cb(text)),
   getPathForFile: (file) => webUtils.getPathForFile(file),
   closeWindow: () => ipcRenderer.invoke("close-current-window"),
   // Screenshot overlay only:

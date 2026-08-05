@@ -60,6 +60,8 @@ class DocumentOut(BaseModel):
     file_path: str | None = None
     source_url: str | None = None
     agent_used: str | None = None
+    ai_insight: str | None = None
+    user_note: str | None = None
     processing_status: str
     created_at: datetime
     updated_at: datetime | None = None
@@ -77,6 +79,10 @@ class DocumentContentOut(BaseModel):
     type_specific_data: dict[str, Any] | None = None
 
     model_config = {"from_attributes": True}
+
+
+class SetNoteRequest(BaseModel):
+    note: str
 
 
 class RetryResponse(BaseModel):
@@ -169,6 +175,8 @@ def _doc_to_out(doc: Document) -> DocumentOut:
         file_path=doc.file_path,
         source_url=doc.source_url,
         agent_used=doc.agent_used,
+        ai_insight=doc.ai_insight,
+        user_note=doc.user_note,
         processing_status=doc.processing_status,
         created_at=doc.created_at,
         updated_at=doc.updated_at,
@@ -283,6 +291,23 @@ async def get_document_content(
         corrected_content=doc.corrected_content,
         type_specific_data=doc.type_specific_data,
     )
+
+
+@router.patch("/documents/{doc_id}/note", response_model=DocumentOut)
+async def set_document_note(
+    doc_id: uuid.UUID,
+    body: SetNoteRequest,
+    orchestrator: OrchestratorDep,
+    db: DbDep,
+) -> DocumentOut:
+    """Attach the user's own personal annotation to an already-saved
+    document — separate from `ai_insight` (LLM-generated), never written by
+    an LLM."""
+    result = await orchestrator.set_user_note(str(doc_id), body.note)
+    if result.get("status") == "failed":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["message"])
+    doc = await crud.get_document(db, doc_id)
+    return _doc_to_out(doc)
 
 
 @router.get("/projects", response_model=list[ProjectOut])

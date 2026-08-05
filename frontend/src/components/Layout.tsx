@@ -7,6 +7,7 @@ const LINKS = [
   { to: "/mindmap", label: "Mindmap" },
   { to: "/actions", label: "會議代辦" },
   { to: "/todos", label: "快速代辦" },
+  { to: "/insight", label: "洞察" },
   { to: "/chat", label: "問答記錄" },
   { to: "/agents", label: "Agents" },
   { to: "/project-sync", label: "跨 Repo 同步" },

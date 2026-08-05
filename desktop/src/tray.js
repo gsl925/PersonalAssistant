@@ -2,6 +2,7 @@ const { app, Tray, Menu, BrowserWindow } = require("electron");
 const path = require("path");
 const { createNoteWindow } = require("./windows/noteWindow");
 const { createTodoWindow } = require("./windows/todoWindow");
+const { createInsightWindow } = require("./windows/insightWindow");
 const { captureScreenshot } = require("./windows/overlayWindow");
 
 const DASHBOARD_URL = "http://localhost:8000/dashboard";
@@ -21,6 +22,7 @@ function createTray() {
       { label: "開啟儀表板", click: openDashboard },
       { label: "快速筆記 (Ctrl+Shift+N)", click: createNoteWindow },
       { label: "快速代辦 (Ctrl+Shift+T)", click: createTodoWindow },
+      { label: "洞察 (Ctrl+Shift+I)", click: createInsightWindow },
       { label: "截圖 (Ctrl+Shift+S)", click: captureScreenshot },
       { type: "separator" },
       {

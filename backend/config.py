@@ -46,6 +46,21 @@ DEFAULT_CAPABILITY_TIERS: CapabilityTiers = {
     "embedding": [
         {"provider": "ollama_local", "model": "bge-m3"},
     ],
+    # "What is the author actually arguing" extraction (backend/insight.py) —
+    # deliberately its own tier rather than reusing "complex_reasoning", since
+    # webclip-agent's summary task and this task have different quality
+    # profiles per-model; keeping them separate lets a local-vs-cloud
+    # comparison for this specific task pick its own winner without affecting
+    # webclip-agent's tier. Decided 2026-08-05 after a real side-by-side on
+    # two TechNews articles (verified against the actual source text, not
+    # just vibes): gpt-oss:120b-cloud consistently surfaced the article's
+    # real point (e.g. caught a "discoverability" angle deepseek-r1:14b's
+    # output missed entirely), so it's primary despite deepseek-r1:14b being
+    # local/free — kept as fallback for when cloud is unavailable.
+    "insight_extraction": [
+        {"provider": "ollama_local", "model": "gpt-oss:120b-cloud"},
+        {"provider": "ollama_local", "model": "deepseek-r1:14b"},
+    ],
 }
 
 

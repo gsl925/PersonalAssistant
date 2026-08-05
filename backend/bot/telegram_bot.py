@@ -117,6 +117,7 @@ class PersonalAssistantBot:
         add(CommandHandler("status", self.handle_status))
         add(CommandHandler("todo", self.handle_todo_command))
         add(CommandHandler("ask", self.handle_ask_command))
+        add(CommandHandler("insight", self.handle_insight_command))
         add(CommandHandler("wake", self.handle_wake_command))
         add(CommandHandler("projects", self.handle_projects_command))
         add(CommandHandler("newproject", self.handle_newproject_command))
@@ -224,6 +225,36 @@ class PersonalAssistantBot:
         except Exception as exc:
             logger.exception("handle_ask_command error: {}", exc)
             await thinking_msg.edit_text(f"❌ 回答時發生錯誤：{exc}")
+
+    async def handle_insight_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """``/insight <url>`` — preview the author's core insight/argument for
+        a URL WITHOUT saving it, mirroring ``/ask``'s placeholder→edit UX. A
+        "💾 收藏" inline button lets the user save it afterward (see
+        handle_callback's ``insight:`` branch) — declining just means never
+        tapping the button, nothing is persisted unless they do."""
+        self._cache_chat_id(update)
+        url = " ".join(context.args or []).strip()
+        if not url:
+            await update.message.reply_text("用法：/insight 連結，例如 /insight https://example.com/article")
+            return
+
+        thinking_msg = await update.message.reply_text("🔎 正在分析這篇內容的核心洞察…")
+        try:
+            result = await self.orchestrator.preview_insight(url)
+            if result["status"] == "ok":
+                title_line = f"📌 {result['title']}\n\n" if result.get("title") else ""
+                text = f"{title_line}💡 {result['insight']}"
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💾 收藏", callback_data=f"insight:{result['preview_id']}:save")],
+                ])
+                await thinking_msg.edit_text(text[:4096], reply_markup=keyboard)
+            else:
+                await thinking_msg.edit_text(f"❌ {result.get('message', '發生錯誤')}")
+        except Exception as exc:
+            logger.exception("handle_insight_command error: {}", exc)
+            await thinking_msg.edit_text(f"❌ 分析時發生錯誤：{exc}")
 
     async def handle_wake_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -603,6 +634,9 @@ class PersonalAssistantBot:
           - ``remind:{reminder_id}:{done|snooze}`` — action button on a fired
             reminder message (works the same in the "待辦提醒" channel as in
             a normal chat — any viewer can tap it, no admin rights needed)
+          - ``insight:{preview_id}:save`` — save button on an ``/insight``
+            preview (see handle_insight_command); the only action, since
+            "don't save" just means never tapping this button
         """
         query = update.callback_query
         await query.answer()
@@ -610,12 +644,29 @@ class PersonalAssistantBot:
         data: str = query.data or ""
         parts = data.split(":", 2)
 
-        if len(parts) != 3 or parts[0] not in ("confirm", "project", "todo", "remind"):
+        if len(parts) != 3 or parts[0] not in ("confirm", "project", "todo", "remind", "insight"):
             logger.warning("Unrecognised callback_data: {!r}", data)
             await query.edit_message_text("❓ 無效的操作。")
             return
 
         kind, doc_id, payload = parts
+
+        if kind == "insight":
+            preview_id = doc_id
+            logger.info("User saved insight preview: preview_id={}", preview_id)
+            try:
+                result = await self.orchestrator.save_insight_preview(preview_id)
+                if result.get("status") == "completed":
+                    text = self._format_completed(result, prefix="✅ ")
+                    if result.get("ai_insight"):
+                        text += f"\n💡 {result['ai_insight']}"
+                    await query.edit_message_text(text[:4096])
+                else:
+                    await query.edit_message_text(f"❌ {result.get('message', '發生錯誤')}")
+            except Exception as exc:
+                logger.exception("handle_callback (insight) error: {}", exc)
+                await query.edit_message_text(f"❌ 收藏時發生錯誤：{exc}")
+            return
 
         if kind == "remind":
             logger.info("Reminder button pressed: reminder_id={} action={}", doc_id, payload)
@@ -823,6 +874,7 @@ class PersonalAssistantBot:
             BotCommand("status", "查看系統狀態"),
             BotCommand("todo", "新增一筆代辦，例如 /todo 記得繳電費 8/5 前"),
             BotCommand("ask", "問 Claude 一個跟專案無關的問題，例如 /ask 台北明天天氣如何"),
+            BotCommand("insight", "看一篇文章/影片的核心洞察，例如 /insight https://example.com"),
             BotCommand("wake", "立刻叫醒一個專案去做事，例如 /wake genai-news 把今天新聞發到telegram"),
             BotCommand("projects", "查看目前追蹤的專案與待決策項目"),
             BotCommand("newproject", "新增一個追蹤中的專案，例如 /newproject D:/path/to/repo 專案名稱"),

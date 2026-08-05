@@ -36,6 +36,9 @@ _SHARED_TAG_MIN_COUNT = 2
 _MAX_RETRIES = 2
 _RETRY_DELAY = 1.5  # seconds between retries
 
+# Cap on Orchestrator.pending_insights — see its declaration in __init__ for why.
+_PENDING_INSIGHTS_MAX = 50
+
 # ---------------------------------------------------------------------------
 # Todo reminder defaults
 # ---------------------------------------------------------------------------
@@ -129,6 +132,12 @@ class Orchestrator:
         self.pending_project_confirmations: dict[str, str] = {}
         # confirmation_id (str) → extracted todo fields awaiting user confirmation
         self.pending_todo_confirmations: dict[str, dict] = {}
+        # preview_id (str) → {"processed": ProcessedContent, "insight": str, "url": str}
+        # awaiting a save/discard decision (see preview_insight/save_insight_preview).
+        # Unlike the other pending_* dicts above, entries here can hold a full
+        # article/transcript body, not just small metadata — capped so a long
+        # run of unsaved previews can't grow this unbounded.
+        self.pending_insights: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -682,6 +691,88 @@ class Orchestrator:
             "category": "chat",
             "tags": [],
         }
+
+    async def preview_insight(self, url: str) -> dict:
+        """Fetch *url* and extract "what is the author actually arguing,"
+        WITHOUT persisting anything — no Document row is created here. The
+        user decides whether to keep it via :meth:`save_insight_preview`;
+        declining just lets the entry age out of ``pending_insights``.
+        """
+        from backend.insight import extract_insight
+
+        try:
+            adapter = AdapterFactory.get_adapter("url", self.model_router, settings.UPLOADS_DIR)
+            processed = await adapter.process(url)
+        except Exception as exc:
+            logger.warning("Insight preview: fetch failed for {}: {}", url, exc)
+            return {"status": "failed", "message": str(exc)}
+
+        insight_result = await extract_insight(
+            self.model_router, processed.original_content, processed.title
+        )
+
+        preview_id = str(uuid.uuid4())
+        if len(self.pending_insights) >= _PENDING_INSIGHTS_MAX:
+            oldest_id = next(iter(self.pending_insights))
+            self.pending_insights.pop(oldest_id, None)
+        self.pending_insights[preview_id] = {
+            "processed": processed,
+            "insight": insight_result["insight"],
+            "url": url,
+        }
+
+        return {
+            "status": "ok",
+            "preview_id": preview_id,
+            "title": processed.title,
+            "insight": insight_result["insight"],
+            "source_url": processed.source_url,
+            "is_video": bool(processed.metadata.get("is_video")),
+        }
+
+    async def save_insight_preview(self, preview_id: str) -> dict:
+        """Persist a previously-previewed insight as a normal webclip
+        Document — reuses _route_and_finalize (the same save path as any
+        fresh URL ingest) so a saved insight gets the usual categorization/
+        tags/project-linking/embedding, then attaches the cached insight text
+        on top via ai_insight.
+        """
+        pending = self.pending_insights.pop(preview_id, None)
+        if pending is None:
+            return {"status": "failed", "message": "找不到這筆洞察預覽（可能已過期或已處理）"}
+
+        processed = pending["processed"]
+        async with self._session_maker() as db:
+            doc = await crud.create_document(db, source_type="webclip", processing_status="pending")
+            await db.commit()
+            doc_id = doc.id
+
+        result = await self._route_and_finalize(doc_id, "url", processed)
+
+        if result.get("status") == "completed":
+            async with self._session_maker() as db:
+                await crud.update_document_fields(db, doc_id, ai_insight=pending["insight"])
+                await db.commit()
+            result["ai_insight"] = pending["insight"]
+
+        return result
+
+    async def set_user_note(self, doc_id: str, note: str) -> dict:
+        """Attach the user's own personal annotation to an already-saved
+        document — never LLM-written, purely a direct write."""
+        try:
+            doc_uuid = uuid.UUID(doc_id)
+        except ValueError:
+            return {"status": "failed", "message": "Invalid doc_id"}
+
+        async with self._session_maker() as db:
+            doc = await crud.update_document_fields(db, doc_uuid, user_note=note)
+            if doc is None:
+                await db.rollback()
+                return {"status": "failed", "message": "Document not found"}
+            await db.commit()
+
+        return {"status": "ok", "doc_id": doc_id, "user_note": note}
 
     async def create_todo_from_text(self, text: str, source: str) -> dict:
         """Explicit-intent todo creation — used by the desktop widget, the

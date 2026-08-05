@@ -83,6 +83,25 @@ async def update_document_status(
     return doc
 
 
+async def update_document_fields(
+    db: AsyncSession,
+    doc_id: uuid.UUID,
+    **fields,
+) -> Document | None:
+    """Like update_document_status but without forcing a processing_status
+    change — for setting fields (ai_insight, user_note) that are orthogonal
+    to the pipeline's own status, on a document that's already completed."""
+    doc = await db.get(Document, doc_id)
+    if doc is None:
+        return None
+    for key, value in fields.items():
+        if hasattr(doc, key):
+            setattr(doc, key, value)
+    doc.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    return doc
+
+
 async def get_documents(
     db: AsyncSession,
     skip: int = 0,

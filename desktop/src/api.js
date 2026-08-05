@@ -54,4 +54,26 @@ async function createTodo(text) {
   return parseOrThrow(res);
 }
 
-module.exports = { ingestText, ingestUrl, ingestFilePath, createTodo, BASE_URL };
+async function previewInsight(url) {
+  const res = await fetch(`${BASE_URL}/api/insight/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  return parseOrThrow(res);
+}
+
+async function saveInsightPreview(previewId) {
+  const res = await fetch(`${BASE_URL}/api/insight/${previewId}/save`, { method: "POST" });
+  return parseOrThrow(res);
+}
+
+module.exports = {
+  ingestText,
+  ingestUrl,
+  ingestFilePath,
+  createTodo,
+  previewInsight,
+  saveInsightPreview,
+  BASE_URL,
+};

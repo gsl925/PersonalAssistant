@@ -7,6 +7,8 @@ import type {
   DocumentContent,
   DocumentFilters,
   DocumentListResponse,
+  InsightPreview,
+  SaveInsightResponse,
   MindmapResponse,
   OcrEngineResponse,
   OllamaModelsResponse,
@@ -231,6 +233,24 @@ export const api = {
   deleteTrackedProject(projectName: string): Promise<{ ok: boolean }> {
     return request(`/api/project-sync/projects/${encodeURIComponent(projectName)}`, {
       method: "DELETE",
+    });
+  },
+
+  previewInsight(url: string): Promise<InsightPreview> {
+    return request(`/api/insight/preview`, {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    });
+  },
+
+  saveInsightPreview(previewId: string): Promise<SaveInsightResponse> {
+    return request(`/api/insight/${previewId}/save`, { method: "POST" });
+  },
+
+  setUserNote(docId: string, note: string): Promise<Document> {
+    return request(`/api/knowledge/documents/${docId}/note`, {
+      method: "PATCH",
+      body: JSON.stringify({ note }),
     });
   },
 };
