@@ -355,17 +355,21 @@ async def wake_now(project_name: str) -> dict:
     its `auto_wake` setting — the opt-in flag exists to gate *unattended*
     execution, not a user's own explicit, in-the-moment ask.
 
-    This is a pure *notification* trigger, not a supervised task run: the
-    caller gets an immediate ack (see handle_wake_command) and PA does not
-    wait on, time-box for reporting purposes, or claim to know the outcome
-    of the triggered session — that would mean either killing genuinely
-    long-running work partway through to make a deadline, or babysitting a
-    task PA has no way to judge "done" from the outside anyway. The actual
-    result always surfaces through the target's own PROGRESS.md (checked
-    boxes, updated report), same as any other instruction — this just makes
-    the target look *now* instead of waiting for its own cadence. A relay
-    message only goes out if the session itself failed to run at all (a
-    real operational problem, not "still working").
+    PA does not wait on or time-box this for reporting purposes — that
+    would mean either killing genuinely long-running work partway through
+    to make a deadline, or babysitting a task PA has no way to judge "done"
+    from the outside anyway. The caller gets an immediate ack (see
+    handle_wake_command) when the session is *triggered*; the checked-box/
+    updated-report state in the target's own PROGRESS.md remains the
+    authoritative record of what actually got done.
+
+    That said, the session's own final text — whatever it decided to say,
+    e.g. "done", "still needs X", or "deferring to Y" — is relayed back on
+    both success and failure (truncated) so an explicit, in-the-moment
+    /wake never looks like it silently did nothing. This is different from
+    _maybe_wake_project's unattended staleness trigger, which stays quiet
+    on success by design (it's a background safety net, not something
+    someone is actively watching for a reply to).
     """
     project = next((p for p in load_tracked_projects() if p.name == project_name), None)
     if project is None:
@@ -384,6 +388,10 @@ async def wake_now(project_name: str) -> dict:
             result = await wake_project(project.repo_path)
             if result["ok"]:
                 logger.info("wake_now session finished for {}.", project_name)
+                output_preview = (result["output"] or "(沒有輸出)")[:1500]
+                await _send_relay(
+                    f"✅「{project.label}」wake 完成：\n\n{output_preview}\n\n#{project.name}"
+                )
             else:
                 await _send_relay(f"❌ 通知「{project.label}」失敗：{result['error']}\n\n#{project.name}")
         finally:

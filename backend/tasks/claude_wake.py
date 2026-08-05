@@ -21,8 +21,11 @@ from loguru import logger
 # generous. Real multi-step instructions (running several scripts in
 # sequence, etc.) need real wall-clock room; a tight timeout here would kill
 # legitimate work partway through for no benefit, since nobody's blocked on
-# the result anyway (see project_sync.wake_now).
-_TIMEOUT_SECONDS = 1800.0
+# the result anyway (see project_sync.wake_now). Widened 300s -> 1800s ->
+# 10800s (3h) as /wake instructions grew to include genuinely long-running
+# work — there's no cost to a generous ceiling since it only ever fires on
+# a real hang, never on legitimate completion.
+_TIMEOUT_SECONDS = 10800.0
 
 _WAKE_PROMPT = (
     "請檢查這個專案的 PROGRESS.md（如果有 SDD_PROGRESS_SYNC.md 就照它的規範），"

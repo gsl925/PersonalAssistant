@@ -228,20 +228,61 @@ class PersonalAssistantBot:
     async def handle_wake_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """On-demand ``/wake <project-slug>`` — DISABLED 2026-07-31, pending
-        redesign. It only ever accomplishes "spin up a brand-new, one-shot
-        local session with full edit/Bash rights right now" — there's no
-        lighter "just nudge an already-scheduled thing" mechanism available
-        (confirmed via RemoteTrigger: no cloud Routine exists for checking
-        PROGRESS.md, and cloud Routines couldn't reach it anyway since
-        PROGRESS.md is deliberately gitignored/local-only). That gap between
-        what the user wanted (accelerate an existing watcher) and what this
-        can actually do (create a new one-shot session each time) is being
-        revisited before re-enabling. See project_sync.wake_now() — the
-        underlying implementation is untouched, just not wired up here.
+        """On-demand ``/wake <project-slug> [事項]`` — immediately spins up a
+        full headless Claude Code session scoped to that project's repo
+        (edit/Bash rights, not read-only), for ANY tracked project
+        regardless of its `auto_wake` setting (see project_sync.wake_now
+        for why that flag doesn't gate this). This is a real work session,
+        not a notification — it's told to actually process "📮 你的指示"
+        (answer questions, edit code, run commands), not just report back.
+
+        Re-enabled 2026-08-04 (previously short-circuited 2026-07-31 over a
+        since-resolved misunderstanding — see project_wake_feature_disabled
+        memory / PROGRESS_HISTORY.md): the user's goal was confirmed to be
+        exactly what wake_now() already does (trigger real work right now),
+        not the nonexistent "nudge an always-on watcher" the old confusion
+        was about.
+
+        The optional [事項] text is queued into that project's "📮 你的指示"
+        (same write_instruction() the #hashtag-reply flow uses) *before*
+        triggering, so one command both hands over a new task and makes the
+        project act on it immediately — otherwise `/wake` only processes
+        whatever's already sitting there unchecked.
         """
         self._cache_chat_id(update)
-        await update.message.reply_text("🚧 /wake 目前暫停使用，設計還在討論中。")
+        args = context.args or []
+        if not args:
+            await update.message.reply_text(
+                "用法：/wake 專案代號 [要做的事]，例如 /wake genai-news 把今天新聞發到telegram"
+            )
+            return
+
+        from backend.config import load_tracked_projects
+        from backend.tasks.project_sync import wake_now, write_instruction
+
+        project_name = args[0].lower()
+        project = next((p for p in load_tracked_projects() if p.name == project_name), None)
+        if project is None:
+            await update.message.reply_text(f"❌ 找不到專案「{args[0]}」，用 /projects 查看目前追蹤的專案。")
+            return
+
+        instruction = " ".join(args[1:]).strip()
+        if instruction:
+            queued = await write_instruction(project_name, instruction)
+            if not queued:
+                await update.message.reply_text(f"❌ 「{project.label}」還沒有 PROGRESS.md，無法轉達。")
+                return
+
+        result = await wake_now(project_name)
+        if result["status"] == "started":
+            suffix = "，已帶上新指示" if instruction else ""
+            await update.message.reply_text(f"🔔 已叫醒「{project.label}」{suffix}，結果請看它的 PROGRESS.md。")
+        elif result["status"] == "already_running":
+            await update.message.reply_text(f"⏳「{project.label}」已經有一個 wake session 在跑，稍等它跑完。")
+        elif result["status"] == "no_progress_file":
+            await update.message.reply_text(f"❌ 「{project.label}」還沒有 PROGRESS.md，無法喚醒。")
+        else:
+            await update.message.reply_text(f"❌ 喚醒「{project.label}」失敗。")
 
     async def handle_newproject_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -782,6 +823,7 @@ class PersonalAssistantBot:
             BotCommand("status", "查看系統狀態"),
             BotCommand("todo", "新增一筆代辦，例如 /todo 記得繳電費 8/5 前"),
             BotCommand("ask", "問 Claude 一個跟專案無關的問題，例如 /ask 台北明天天氣如何"),
+            BotCommand("wake", "立刻叫醒一個專案去做事，例如 /wake genai-news 把今天新聞發到telegram"),
             BotCommand("projects", "查看目前追蹤的專案與待決策項目"),
             BotCommand("newproject", "新增一個追蹤中的專案，例如 /newproject D:/path/to/repo 專案名稱"),
             BotCommand("broadcast", "把同一段指令寫進所有追蹤中專案的 PROGRESS.md，例如 /broadcast 明天休息一天"),
