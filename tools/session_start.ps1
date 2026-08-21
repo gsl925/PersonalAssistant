@@ -5,7 +5,7 @@
 # a second Claude Code session in this project doesn't spawn duplicate
 # processes or error out trying to rebind ports 6333/8000.
 
-$root = "D:\_SideProject\PersonalContent_Assistant"
+$root = Split-Path -Parent $PSScriptRoot
 
 function Test-PortOpen($port) {
     $conn = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
