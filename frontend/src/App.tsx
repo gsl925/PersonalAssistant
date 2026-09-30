@@ -10,6 +10,7 @@ import SettingsView from "./components/SettingsView";
 import AgentsView from "./components/AgentsView";
 import ProjectSyncView from "./components/ProjectSyncView";
 import ChatView from "./components/ChatView";
+import DevTaskView from "./components/DevTaskView";
 
 export default function App() {
   return (
@@ -24,6 +25,7 @@ export default function App() {
         <Route path="chat" element={<ChatView />} />
         <Route path="agents" element={<AgentsView />} />
         <Route path="project-sync" element={<ProjectSyncView />} />
+        <Route path="dev-task" element={<DevTaskView />} />
         <Route path="settings" element={<SettingsView />} />
       </Route>
     </Routes>

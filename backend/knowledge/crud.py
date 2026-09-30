@@ -16,6 +16,8 @@ from backend.knowledge.models import (
     Project,
     Todo,
     TodoReminder,
+    Tool,
+    ToolChangeLog,
 )
 
 
@@ -606,3 +608,82 @@ async def get_mindmap_data(
     )
     nodes = docs_result.scalars().all()
     return nodes, all_edges
+
+
+# ---------------------------------------------------------------------------
+# Tools (factory-tools dev-agent registry)
+# ---------------------------------------------------------------------------
+
+
+async def list_tools(db: AsyncSession) -> Sequence[Tool]:
+    result = await db.execute(select(Tool).where(Tool.status == "active").order_by(Tool.display_name))
+    return result.scalars().all()
+
+
+async def get_tool_by_name(db: AsyncSession, name: str) -> Tool | None:
+    result = await db.execute(select(Tool).where(Tool.name == name))
+    return result.scalar_one_or_none()
+
+
+async def create_tool(
+    db: AsyncSession,
+    name: str,
+    display_name: str,
+    repo_relative_path: str,
+    description: str | None = None,
+    reference_path: str | None = None,
+) -> Tool:
+    tool = Tool(
+        name=name,
+        display_name=display_name,
+        repo_relative_path=repo_relative_path,
+        description=description,
+        reference_path=reference_path,
+    )
+    db.add(tool)
+    await db.flush()
+    return tool
+
+
+async def create_tool_change_log(
+    db: AsyncSession,
+    tool_id: uuid.UUID,
+    change_summary: str,
+    change_reason: str,
+    diff_text: str,
+    drafted_by: str,
+    self_test_result: str | None = None,
+    reference_path: str | None = None,
+    source_document_id: uuid.UUID | None = None,
+) -> ToolChangeLog:
+    change_log = ToolChangeLog(
+        tool_id=tool_id,
+        change_summary=change_summary,
+        change_reason=change_reason,
+        diff_text=diff_text,
+        drafted_by=drafted_by,
+        self_test_result=self_test_result,
+        reference_path=reference_path,
+        source_document_id=source_document_id,
+    )
+    db.add(change_log)
+    await db.flush()
+    return change_log
+
+
+async def update_tool_change_log_review(
+    db: AsyncSession,
+    change_log_id: uuid.UUID,
+    review_source: str,
+    confidence_score: float,
+    status: str,
+    blocked_reason: str | None = None,
+) -> None:
+    change_log = await db.get(ToolChangeLog, change_log_id)
+    if change_log is None:
+        return
+    change_log.review_source = review_source
+    change_log.confidence_score = confidence_score
+    change_log.status = status
+    change_log.blocked_reason = blocked_reason
+    await db.flush()

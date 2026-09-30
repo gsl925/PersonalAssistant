@@ -11,6 +11,7 @@ const LINKS = [
   { to: "/chat", label: "問答記錄" },
   { to: "/agents", label: "Agents" },
   { to: "/project-sync", label: "跨 Repo 同步" },
+  { to: "/dev-task", label: "開發任務" },
   { to: "/settings", label: "設定" },
 ];
 

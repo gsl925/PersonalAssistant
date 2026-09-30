@@ -1,18 +1,23 @@
 projects:
-  - name: genai-news
-    label: "GenAI News"
-    repo_path: "D:/_SideProject/Topic_News/genai"
-    enabled: true
-    auto_wake: false  # verified working 2026-07-30 — turn back on if needed, see claude_wake.py
-  - name: personal-assistant
-    label: "Personal Assistant"
-    repo_path: "D:/_SideProject/PersonalContent_Assistant"
-    enabled: true
-  - name: aegis-trader
-    label: "AegisTrader"
-    repo_path: "D:/_SideProject/AegisTrader"
-    enabled: true
-  - name: investment
-    label: "Investment"
-    repo_path: "D:/_SideProject/Investment"
-    enabled: true
+- name: genai-news
+  label: GenAI News
+  repo_path: D:/_SideProject/Topic_News/genai
+  enabled: true
+  auto_wake: false
+- name: personal-assistant
+  label: Personal Assistant
+  repo_path: D:/_SideProject/PersonalContent_Assistant
+  enabled: true
+- name: aegis-trader
+  label: AegisTrader
+  repo_path: D:/_SideProject/AegisTrader
+  enabled: true
+- name: investment
+  label: Investment
+  repo_path: D:/_SideProject/Investment
+  enabled: true
+- name: factory-tools
+  label: Factory Tools
+  repo_path: D:\_SideProject\factory-tools
+  enabled: true
+  auto_wake: false

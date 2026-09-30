@@ -309,6 +309,97 @@ class TodoReminder(Base):
 
 
 # ---------------------------------------------------------------------------
+# Tool  (a factory tool tracked in the separate `factory-tools` project —
+# dev-agent drafts/writes/tests code for these; this row persists across the
+# tool's lifetime, since it gets revisited repeatedly, not a one-shot record)
+# ---------------------------------------------------------------------------
+
+
+class Tool(Base):
+    __tablename__ = "tools"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Path relative to the factory-tools repo root, e.g. "tools/log_checker_a"
+    repo_relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Path to reference code the user pointed dev-agent at when first
+    # building this tool, if any — NULL means it was built from scratch.
+    reference_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", index=True
+    )  # active / deprecated
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, onupdate=_utcnow
+    )
+
+    change_logs: Mapped[list[ToolChangeLog]] = relationship(
+        "ToolChangeLog", back_populates="tool", cascade="all, delete-orphan"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ToolChangeLog  (one row per dev-agent change to a Tool. No git involved by
+# design — factory-tools is a plain local folder, never git-initialized;
+# diff_text is the entire change record, not a pointer to a commit)
+# ---------------------------------------------------------------------------
+
+
+class ToolChangeLog(Base):
+    __tablename__ = "tool_change_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tool_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tools.id", ondelete="CASCADE"), nullable=False
+    )
+    change_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    change_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    diff_text: Mapped[str] = mapped_column(Text, nullable=False)
+    drafted_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Reference code path used for THIS specific change, if any — distinct
+    # from Tool.reference_path (which only captures the tool's original
+    # build), since a later change can point at a different reference.
+    reference_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Links back to the Document (screenshot/meeting/note) whose content
+    # this change request actually came from, if it arrived that way rather
+    # than as a plain-text request — lets the change be traced back to the
+    # real discussion/evidence, not just a written summary of it.
+    source_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
+    )
+    self_test_result: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Which model reviewed this change after dev-agent's self-test: the
+    # normal path is "claude-code"; "cloud-fallback:{model}" records that
+    # Claude Code's own quota was exhausted and review fell back to an
+    # existing free cloud tier instead.
+    review_source: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    confidence_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="drafted", index=True
+    )  # drafted / self_tested / blocked / landed
+    # Set when status="blocked" — why the review gate rejected this change.
+    blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    tool: Mapped[Tool] = relationship("Tool", back_populates="change_logs")
+
+    __table_args__ = (
+        Index("ix_tool_change_logs_tool_id", "tool_id"),
+        Index("ix_tool_change_logs_source_document_id", "source_document_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # AgentConfig
 # ---------------------------------------------------------------------------
 

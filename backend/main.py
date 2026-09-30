@@ -11,6 +11,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import Scope
 
 from backend.config import settings
 from backend.knowledge.db import async_session_maker, init_db
@@ -33,6 +35,23 @@ logger.add(
     encoding="utf-8",
     level="INFO",
 )
+
+# ---------------------------------------------------------------------------
+class SPAStaticFiles(StaticFiles):
+    """Falls back to index.html for any path StaticFiles can't resolve to a
+    real file — needed because the dashboard is a client-side-routed SPA
+    (React Router): a hard refresh or direct link to e.g. /dashboard/timeline
+    has no matching file on disk, only client-side JS that knows how to
+    render that route once index.html has actually loaded."""
+
+    async def get_response(self, path: str, scope: Scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code == 404:
+                return await super().get_response("index.html", scope)
+            raise
+
 
 # ---------------------------------------------------------------------------
 # Application-level singletons
@@ -203,6 +222,7 @@ def create_app() -> FastAPI:
     # API routers
     # ------------------------------------------------------------------
     from backend.api.agents import router as agents_router
+    from backend.api.dev_tasks import router as dev_tasks_router
     from backend.api.ingest import router as ingest_router
     from backend.api.insight import router as insight_router
     from backend.api.knowledge import router as knowledge_router
@@ -217,6 +237,7 @@ def create_app() -> FastAPI:
     app.include_router(todos_router)
     app.include_router(project_sync_router)
     app.include_router(insight_router)
+    app.include_router(dev_tasks_router)
 
     # ------------------------------------------------------------------
     # Static files — dashboard served at /dashboard
@@ -225,7 +246,7 @@ def create_app() -> FastAPI:
     if dashboard_dir.exists():
         app.mount(
             "/dashboard",
-            StaticFiles(directory=str(dashboard_dir), html=True),
+            SPAStaticFiles(directory=str(dashboard_dir), html=True),
             name="dashboard",
         )
         logger.info("Dashboard static files mounted from {}", dashboard_dir)

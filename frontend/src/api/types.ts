@@ -206,6 +206,57 @@ export interface BroadcastInstructionResponse {
   failed: string[];
 }
 
+// --- dev_tasks.py ---
+
+export interface ToolOut {
+  name: string;
+  display_name: string;
+  description: string | null;
+}
+
+export interface ToolListResponse {
+  items: ToolOut[];
+}
+
+export interface AttachmentUploadResponse {
+  relative_path: string;
+}
+
+export interface DevTaskSubmitRequest {
+  description: string;
+  reference_path?: string;
+  attachment_path?: string;
+  target_tool?: string;
+  new_tool_name?: string;
+  notify: "default" | "none";
+
+  task_type?: string;
+  example_input?: string;
+  example_output?: string;
+
+  input_source?: string[];
+  file_filter?: string[];
+  filter_detail?: string;
+  folder_depth?: string;
+
+  extraction_method?: string[];
+  calc_method?: string[];
+  exception_handling?: string[];
+  comparison_scope?: string[];
+
+  output_format?: string[];
+  completion_report?: string[];
+  result_format?: string;
+  keep_full_log?: boolean;
+
+  additional_notes?: string;
+  local_model?: string;
+}
+
+export interface DevTaskSubmitResponse {
+  ok: boolean;
+}
+
 // --- settings.py ---
 
 export interface ModelEntry {

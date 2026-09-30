@@ -23,6 +23,10 @@ import type {
   TrackedProjectListResponse,
   AddTrackedProjectResponse,
   BroadcastInstructionResponse,
+  ToolListResponse,
+  AttachmentUploadResponse,
+  DevTaskSubmitRequest,
+  DevTaskSubmitResponse,
 } from "./types";
 
 class ApiError extends Error {
@@ -49,6 +53,25 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(res.status, detail);
   }
   if (res.status === 204) return undefined as T;
+  return res.json() as Promise<T>;
+}
+
+async function requestMultipart<T>(path: string, formData: FormData): Promise<T> {
+  // No Content-Type header here — the browser sets it (with the multipart
+  // boundary) automatically when the body is a FormData instance; setting
+  // it manually, or letting request()'s default JSON header apply, would
+  // break the boundary and the server can't parse the upload.
+  const res = await fetch(path, { method: "POST", body: formData });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const body = await res.json();
+      detail = body.detail ?? JSON.stringify(body);
+    } catch {
+      // ignore, keep statusText
+    }
+    throw new ApiError(res.status, detail);
+  }
   return res.json() as Promise<T>;
 }
 
@@ -251,6 +274,23 @@ export const api = {
     return request(`/api/knowledge/documents/${docId}/note`, {
       method: "PATCH",
       body: JSON.stringify({ note }),
+    });
+  },
+
+  listDevTaskTools(): Promise<ToolListResponse> {
+    return request(`/api/dev-tasks/tools`);
+  },
+
+  uploadDevTaskAttachment(file: File): Promise<AttachmentUploadResponse> {
+    const formData = new FormData();
+    formData.append("file", file);
+    return requestMultipart(`/api/dev-tasks/attachment`, formData);
+  },
+
+  submitDevTask(body: DevTaskSubmitRequest): Promise<DevTaskSubmitResponse> {
+    return request(`/api/dev-tasks/submit`, {
+      method: "POST",
+      body: JSON.stringify(body),
     });
   },
 };
