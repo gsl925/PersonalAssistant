@@ -140,30 +140,43 @@ class WebclipAdapter(BaseAdapter):
 
     def _download_youtube_audio(self, video_id: str) -> tuple[Path, Path] | None:
         """Blocking helper (run via asyncio.to_thread): downloads the best
-        available audio-only stream, no ffmpeg post-processing required."""
+        available audio-only stream, no ffmpeg post-processing required.
+
+        Tries the android player client first: YouTube's default web client
+        now resolves stream URLs that get 403'd on download for some videos,
+        while android's still work. Falls back to the default client for
+        videos android can't resolve a format for."""
         import yt_dlp
 
-        tmp_dir = Path(tempfile.mkdtemp(prefix="ytaudio_"))
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": str(tmp_dir / f"{video_id}.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "noprogress": True,
-        }
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(
-                    f"https://www.youtube.com/watch?v={video_id}", download=True
-                )
-                filepath = Path(ydl.prepare_filename(info))
-            if filepath.exists():
-                return filepath, tmp_dir
-        except Exception as exc:
-            logger.warning("yt-dlp audio download failed for {}: {}", video_id, exc)
+        for player_client in ("android", None):
+            tmp_dir = Path(tempfile.mkdtemp(prefix="ytaudio_"))
+            ydl_opts = {
+                "format": "bestaudio/best",
+                "outtmpl": str(tmp_dir / f"{video_id}.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "noprogress": True,
+            }
+            if player_client:
+                ydl_opts["extractor_args"] = {"youtube": {"player_client": [player_client]}}
 
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(
+                        f"https://www.youtube.com/watch?v={video_id}", download=True
+                    )
+                    filepath = Path(ydl.prepare_filename(info))
+                if filepath.exists():
+                    return filepath, tmp_dir
+            except Exception as exc:
+                logger.warning(
+                    "yt-dlp audio download failed for {} (player_client={}): {}",
+                    video_id, player_client or "default", exc,
+                )
+
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
         return None
 
     async def _fetch_page(self, url: str) -> tuple[str, str | None]:
