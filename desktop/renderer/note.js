@@ -32,9 +32,20 @@ input.addEventListener("keydown", (e) => {
   const isUrl = text.startsWith("http://") || text.startsWith("https://");
   status.textContent = isUrl ? "🔗 已送出，處理中…" : "📝 已送出，處理中…";
 
+  const preview = text.length > 30 ? text.slice(0, 30) + "…" : text;
   const promise = isUrl ? window.api.ingestUrl(text) : window.api.ingestText(text);
   promise
-    .then(() => flashStatus("✓ 完成：" + (text.length > 30 ? text.slice(0, 30) + "…" : text)))
+    .then((res) => {
+      // URL ingestion is backgrounded on the backend (a caption-less
+      // YouTube video can take 10+ minutes to transcribe) — it resolves
+      // almost immediately with status "processing", not "completed". Don't
+      // claim done when it isn't; the doc keeps cooking server-side.
+      if (res && res.status === "processing") {
+        flashStatus("🔗 處理中（背景）：" + preview);
+      } else {
+        flashStatus("✓ 完成：" + preview);
+      }
+    })
     .catch((err) => flashStatus("✗ 失敗：" + err.message));
 });
 

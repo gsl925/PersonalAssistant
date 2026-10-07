@@ -142,5 +142,10 @@ async def ingest_url(
             detail="url must not be empty",
         )
     logger.info("POST /api/ingest/url — {}", url)
-    result = await orchestrator.process_input("url", url)
+    # Backgrounded: a caption-less YouTube video can sit in whisper
+    # transcription for 10+ minutes, and Node's fetch (the desktop widget's
+    # HTTP client) throws its own headers timeout at 5 minutes — this
+    # endpoint already declares 202, so actually return that fast instead
+    # of blocking the request on the full pipeline.
+    result = await orchestrator.process_input_background("url", url)
     return IngestResponse(**result)

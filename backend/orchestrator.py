@@ -138,6 +138,10 @@ class Orchestrator:
         # article/transcript body, not just small metadata — capped so a long
         # run of unsaved previews can't grow this unbounded.
         self.pending_insights: dict[str, dict] = {}
+        # asyncio only holds a *weak* reference to a task once nothing else
+        # points at it, which can GC a process_input_background() task
+        # mid-run — keep a strong reference here until it's done.
+        self._background_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -171,10 +175,49 @@ class Orchestrator:
             confidence      present when status is "pending_confirmation"
             available_agents  present when no confident match was found
         """
-        # 1. Persist a stub record immediately so every input is traceable.
-        source_type = self._normalize_source_type(input_type)
-        doc_id: uuid.UUID | None = None
+        doc_id = await self._create_stub(input_type)
+        if doc_id is None:
+            return {"status": "failed", "doc_id": None, "message": "Database error creating stub"}
 
+        return await self._run_pipeline(doc_id, input_type, input_data, user_context)
+
+    async def process_input_background(
+        self,
+        input_type: str,
+        input_data: Any,
+        user_context: dict | None = None,
+    ) -> dict:
+        """Like :meth:`process_input`, but returns as soon as the stub is
+        saved instead of blocking for the full adapter+routing pipeline.
+
+        For HTTP callers that can't sit on a multi-minute await: e.g. the
+        desktop widget's Node ``fetch`` (undici) throws its own headers
+        timeout at 5 minutes, which was firing — and showing a false
+        "failed" to the user — while a caption-less YouTube video was still
+        happily transcribing via whisper in the (still-synchronous)
+        process_input path. Telegram's handlers don't have this problem:
+        they already send an immediate ack and only await the result to
+        compose a *second*, later message — there's no outside HTTP client
+        with a deadline on that await.
+        """
+        doc_id = await self._create_stub(input_type)
+        if doc_id is None:
+            return {"status": "failed", "doc_id": None, "message": "Database error creating stub"}
+
+        async def _continue() -> None:
+            try:
+                await self._run_pipeline(doc_id, input_type, input_data, user_context)
+            except Exception as exc:  # noqa: BLE001 — last-resort net for a detached task
+                logger.exception("Background pipeline failed for doc {}: {}", doc_id, exc)
+
+        task = asyncio.create_task(_continue())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return {"status": "processing", "doc_id": str(doc_id), "message": "Processing in background"}
+
+    async def _create_stub(self, input_type: str) -> uuid.UUID | None:
+        """Persist a stub record immediately so every input is traceable."""
+        source_type = self._normalize_source_type(input_type)
         try:
             async with self._session_maker() as db:
                 doc = await crud.create_document(
@@ -185,14 +228,25 @@ class Orchestrator:
                 await db.commit()
                 doc_id = doc.id
             logger.info("Saved raw input stub — doc_id={} source_type={}", doc_id, source_type)
+            return doc_id
         except Exception as exc:
             logger.error("Failed to create document stub: {}", exc)
-            return {"status": "failed", "doc_id": None, "message": f"Database error: {exc}"}
+            return None
 
-        # 2. Run the adapter to normalise the raw input. Flip to "processing"
-        # first so a poller can tell "actively transcribing/extracting" apart
-        # from "still queued" — adapter.process() can take minutes for audio
-        #/video (whisper transcription), during which nothing else updates.
+    async def _run_pipeline(
+        self,
+        doc_id: uuid.UUID,
+        input_type: str,
+        input_data: Any,
+        user_context: dict | None,
+    ) -> dict:
+        """Run the adapter to normalise the raw input, then route+finalize.
+
+        Flips to "processing" first so a poller can tell "actively
+        transcribing/extracting" apart from "still queued" — adapter.process()
+        can take minutes for audio/video (whisper transcription), during
+        which nothing else updates.
+        """
         try:
             async with self._session_maker() as db:
                 await crud.update_document_status(db, doc_id, "processing")
