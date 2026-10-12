@@ -3,10 +3,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import yaml
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from ruamel.yaml import YAML
+
+# Round-trip loader/dumper — unlike PyYAML's safe_load/safe_dump, this
+# preserves hand-written comments (e.g. "auto_wake: false  # verified
+# working 2026-07-30...") across a load-then-dump cycle, so adding/removing
+# a tracked project no longer silently wipes out every comment in the file.
+_yaml = YAML()
+_yaml.preserve_quotes = True
+_yaml.indent(mapping=2, sequence=2, offset=0)
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +53,20 @@ DEFAULT_CAPABILITY_TIERS: CapabilityTiers = {
     ],
     "embedding": [
         {"provider": "ollama_local", "model": "bge-m3"},
+    ],
+    # Knowledge-base RAG answer generation (/api/chat/ask_kb, Telegram /kb) —
+    # this is the default path (cloud is opt-in per call). Deliberately
+    # excludes gpt-oss:120b-cloud (unlike complex_reasoning above) — mixing a
+    # cloud-hosted fallback in here would make "local" results secretly
+    # cloud-assisted. gemma4:26b is primary: live-tested 2026-10-05 against
+    # qwen3:8b on the same question/context — 26b caught specific figures and
+    # ranges (e.g. "1%~5%") that 8b dropped, closer to Claude's detail level,
+    # at a real cost (~137s vs ~21s). qwen3:8b stays as the fast fallback.
+    # qwen3.8:27b was tried too and timed out past 180s on this hardware —
+    # not viable, so not included here.
+    "rag_local": [
+        {"provider": "ollama_local", "model": "gemma4:26b"},
+        {"provider": "ollama_local", "model": "qwen3:8b"},
     ],
     # "What is the author actually arguing" extraction (backend/insight.py) —
     # deliberately its own tier rather than reusing "complex_reasoning", since
@@ -202,6 +224,14 @@ class TrackedProject(BaseModel):
     auto_wake: bool = False
 
 
+def _yaml_dump(data: Any, path: Path) -> None:
+    import io
+
+    buf = io.StringIO()
+    _yaml.dump(data, buf)
+    path.write_text(buf.getvalue(), encoding="utf-8")
+
+
 def load_tracked_projects() -> list[TrackedProject]:
     """Read projects.yaml fresh on every call (cheap — a handful of entries)
     so the list can be edited without restarting the backend. Returns only
@@ -213,7 +243,7 @@ def load_tracked_projects() -> list[TrackedProject]:
         logger.warning("projects.yaml not found at {}; no projects tracked.", path)
         return []
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = _yaml.load(path.read_text(encoding="utf-8")) or {}
         projects = [TrackedProject(**entry) for entry in data.get("projects", [])]
     except Exception as exc:
         logger.error("Failed to parse {}: {}", path, exc)
@@ -230,7 +260,7 @@ def add_tracked_project(name: str, label: str, repo_path: str, auto_wake: bool =
     """
     path = settings.PROJECTS_YAML_PATH
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+        data = _yaml.load(path.read_text(encoding="utf-8")) if path.exists() else {}
     except Exception as exc:
         logger.error("Failed to parse {}: {}", path, exc)
         data = {}
@@ -241,7 +271,7 @@ def add_tracked_project(name: str, label: str, repo_path: str, auto_wake: bool =
     entries.append(
         {"name": name, "label": label, "repo_path": repo_path, "enabled": True, "auto_wake": auto_wake}
     )
-    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    _yaml_dump(data, path)
     return True
 
 
@@ -257,14 +287,20 @@ def remove_tracked_project(name: str) -> bool:
     if not path.exists():
         return False
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = _yaml.load(path.read_text(encoding="utf-8")) or {}
     except Exception as exc:
         logger.error("Failed to parse {}: {}", path, exc)
         return False
     entries = data.get("projects", [])
-    remaining = [e for e in entries if e.get("name") != name]
-    if len(remaining) == len(entries):
+    matching_indices = [i for i, e in enumerate(entries) if e.get("name") == name]
+    if not matching_indices:
         return False
-    data["projects"] = remaining
-    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    # Delete matching entries by index, in reverse, directly on the existing
+    # CommentedSeq (rather than reassigning data["projects"] to a fresh
+    # plain list) — ruamel keeps standalone/sequence-level comments aligned
+    # with the remaining items' indices when you delete through its own
+    # __delitem__, but a wholesale replacement loses that bookkeeping.
+    for i in reversed(matching_indices):
+        del entries[i]
+    _yaml_dump(data, path)
     return True

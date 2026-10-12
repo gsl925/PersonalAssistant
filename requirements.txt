@@ -25,6 +25,7 @@ openai>=1.30.0
 # --- Markdown / Frontmatter Parsing ---
 python-frontmatter>=1.1.0
 pyyaml>=6.0.1
+ruamel.yaml>=0.18
 
 # --- Document Parsing ---
 python-docx>=1.1.0

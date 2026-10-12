@@ -9,6 +9,8 @@ import type {
   DocumentListResponse,
   InsightPreview,
   SaveInsightResponse,
+  AskChatResponse,
+  AskKnowledgeBaseResponse,
   MindmapResponse,
   OcrEngineResponse,
   OllamaModelsResponse,
@@ -268,6 +270,20 @@ export const api = {
 
   saveInsightPreview(previewId: string): Promise<SaveInsightResponse> {
     return request(`/api/insight/${previewId}/save`, { method: "POST" });
+  },
+
+  askChat(question: string): Promise<AskChatResponse> {
+    return request(`/api/chat/ask`, {
+      method: "POST",
+      body: JSON.stringify({ question }),
+    });
+  },
+
+  askKnowledgeBase(question: string, includeCloud = false): Promise<AskKnowledgeBaseResponse> {
+    return request(`/api/chat/ask_kb`, {
+      method: "POST",
+      body: JSON.stringify({ question, include_cloud: includeCloud }),
+    });
   },
 
   setUserNote(docId: string, note: string): Promise<Document> {

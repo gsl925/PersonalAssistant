@@ -59,7 +59,8 @@ class ModelRouter:
         **kwargs,
     ) -> str:
         """Run a text-only chat completion through the given capability tier."""
-        return await self._run_chain(tier, messages, image_base64=None, **kwargs)
+        content, _model = await self._run_chain(tier, messages, image_base64=None, **kwargs)
+        return content
 
     async def chat_with_image(
         self,
@@ -69,7 +70,19 @@ class ModelRouter:
         **kwargs,
     ) -> str:
         """Run a vision chat completion (image + text)."""
-        return await self._run_chain(tier, messages, image_base64=image_base64, **kwargs)
+        content, _model = await self._run_chain(tier, messages, image_base64=image_base64, **kwargs)
+        return content
+
+    async def chat_with_meta(
+        self,
+        tier: str,
+        messages: list[dict],
+        **kwargs,
+    ) -> tuple[str, str]:
+        """Like :meth:`chat`, but also returns which model in the fallback
+        chain actually answered — needed by the knowledge-base RAG endpoint
+        to label which local model produced a given answer."""
+        return await self._run_chain(tier, messages, image_base64=None, **kwargs)
 
     async def get_embedding(self, text: str) -> list[float]:
         """Return an embedding vector for *text* using the embedding tier."""
@@ -103,7 +116,7 @@ class ModelRouter:
         messages: list[dict],
         image_base64: str | None,
         **kwargs,
-    ) -> str:
+    ) -> tuple[str, str]:
         chain = self._tiers.get(tier)
         if not chain:
             raise AllProvidersFailedError(f"Unknown capability tier: {tier!r}")
@@ -121,7 +134,7 @@ class ModelRouter:
                 response = await self._make_chat_call(
                     base_url, api_key, model, messages, image_base64, **kwargs
                 )
-                return response
+                return response, model
             except QuotaExceededError:
                 self._set_cooldown(provider, model, hours=1)
                 logger.warning(

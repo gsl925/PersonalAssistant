@@ -352,6 +352,20 @@ def _fmt_checklist(label: str, items: list[str], detail: str | None = None) -> s
     return line
 
 
+def _normalize_reference_path(reference_path: Path | None) -> tuple[Path | None, str | None]:
+    """_Sandbox scopes 'ref:' access to a *directory* root (list_dir/
+    glob_files need something to list/glob). A user pointing at a single
+    reference file (e.g. one log file, not a folder of them) is a
+    legitimate case — use its parent directory as the root instead of
+    rejecting it. Returns (root_dir, original_file_name_or_None) so the
+    caller can still tell the model exactly which file was meant, instead
+    of leaving it to guess among whatever else lives in that directory.
+    """
+    if reference_path is not None and reference_path.is_file():
+        return reference_path.parent, reference_path.name
+    return reference_path, None
+
+
 async def _run_agent_loop(
     task_description: str,
     repo_path: Path,
@@ -378,17 +392,26 @@ async def _run_agent_loop(
 ) -> tuple[str, _Sandbox]:
     """Runs the tool-calling loop until the model finishes or a hard limit
     is hit. Returns (final_summary_text, sandbox) — raises on abort."""
-    sandbox = _Sandbox(repo_path, reference_path)
+    reference_root, reference_file_hint = _normalize_reference_path(reference_path)
+
+    sandbox = _Sandbox(repo_path, reference_root)
 
     user_parts = [f"任務需求：{task_description}"]
     if task_type:
         user_parts.append(f"任務類型：{task_type}")
-    if reference_path is not None:
+    if reference_root is not None:
+        file_hint_line = (
+            f"－ 使用者指定的參考檔案就是：ref:{reference_file_hint}"
+            f"（絕對路徑：{reference_path}）\n"
+            if reference_file_hint
+            else ""
+        )
         user_parts.append(
-            f"參考資料根目錄：{reference_path}\n"
-            "－ list_dir / glob_files / read_file 這三個工具：用 'ref:' 前綴存取，後面接的路徑/pattern"
+            f"參考資料根目錄：{reference_root}\n"
+            + file_hint_line
+            + "－ list_dir / glob_files / read_file 這三個工具：用 'ref:' 前綴存取，後面接的路徑/pattern"
             "是相對於這個根目錄，不要再重複整個根目錄路徑（例如 'ref:**/CinebenchResults.csv' 是對的，"
-            "'ref:" + str(reference_path) + "\\**\\CinebenchResults.csv' 是錯的，會失敗）。\n"
+            "'ref:" + str(reference_root) + "\\**\\CinebenchResults.csv' 是錯的，會失敗）。\n"
             "－ run_command 這個工具：是真的 shell，完全不認得 'ref:' 前綴，要用上面這個真實絕對路徑本身。"
         )
     if attachment_path:

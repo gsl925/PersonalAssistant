@@ -47,7 +47,7 @@ export default function ProjectView() {
   return (
     <div style={{ display: "flex", gap: 20, height: "100%" }}>
       <div style={{ width: 220, flexShrink: 0 }}>
-        <h3 style={{ fontSize: 13, marginTop: 0 }}>專案</h3>
+        <h3 style={{ fontSize: 13, marginTop: 0 }}>主題</h3>
         <button
           onClick={() => setSelected(ALL_DOCS)}
           className={selected === ALL_DOCS ? "primary" : undefined}
@@ -66,12 +66,12 @@ export default function ProjectView() {
             </button>
             <ConfirmDeleteButton
               onConfirm={() => removeProject(p)}
-              title="刪除此專案標籤"
+              title="刪除此主題標籤"
               style={{ flexShrink: 0 }}
             />
           </div>
         ))}
-        {projects.length === 0 && <p className="muted" style={{ fontSize: 12 }}>尚無專案</p>}
+        {projects.length === 0 && <p className="muted" style={{ fontSize: 12 }}>尚無主題</p>}
       </div>
 
       <div style={{ flex: 1, minWidth: 0 }}>

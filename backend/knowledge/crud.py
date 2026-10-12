@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime, time, timezone
 from typing import Any, Sequence
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -140,6 +141,19 @@ async def get_documents(
     return result.scalars().all()
 
 
+async def get_documents_by_ids(
+    db: AsyncSession, doc_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, Document]:
+    """Batch-fetch documents by id, keyed by id — used by the RAG retrieval
+    step to pull full rows for a Qdrant hit list in one query. Caller is
+    responsible for re-applying the Qdrant ranking order; a plain IN query
+    doesn't preserve it."""
+    if not doc_ids:
+        return {}
+    result = await db.execute(select(Document).where(Document.id.in_(doc_ids)))
+    return {doc.id: doc for doc in result.scalars().all()}
+
+
 async def delete_document(db: AsyncSession, doc_id: uuid.UUID) -> tuple[bool, str | None]:
     """Delete a document row — cascades to its tags/project links/relations
     (cascade="all, delete-orphan" on Document's relationships). Returns
@@ -209,8 +223,14 @@ async def list_action_items(
     return items
 
 
+_TAIPEI = ZoneInfo("Asia/Taipei")
+
+
 async def get_documents_created_today(db: AsyncSession) -> Sequence[Document]:
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    """Documents added since Asia/Taipei midnight (the digest's local "today"),
+    not UTC midnight — the digest runs at 08:00 Taipei, which is 00:00 UTC, so
+    a UTC-midnight boundary collapsed this window to zero width."""
+    today_start = datetime.now(_TAIPEI).replace(hour=0, minute=0, second=0, microsecond=0)
     result = await db.execute(
         select(Document)
         .options(selectinload(Document.tags))

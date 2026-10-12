@@ -19,6 +19,13 @@ from backend.model_router import AllProvidersFailedError, ModelRouter
 from backend.skill_schemas import normalize_agent_output
 from backend.skills_loader import SkillDefinition, SkillsLoader
 
+
+class AgentExecutionFailedError(Exception):
+    """Raised when an agent call never produced usable output (LLM call
+    failed on every provider, or its response wasn't parseable JSON) — the
+    document must be left/marked 'failed' so retry_document() can pick it
+    back up, instead of silently saving a placeholder as 'completed'."""
+
 # ---------------------------------------------------------------------------
 # Confidence thresholds (SDD §4.1)
 # ---------------------------------------------------------------------------
@@ -34,7 +41,10 @@ _SHARED_TAG_MIN_COUNT = 2
 
 # Max retries for transient LLM / DB failures
 _MAX_RETRIES = 2
-_RETRY_DELAY = 1.5  # seconds between retries
+# Seconds between retries (base of the exponential back-off). 1.5s was too
+# short to ride out an Ollama model swap or contention with dev-agent, so
+# both retries ended up hitting the same transient failure.
+_RETRY_DELAY = 5.0
 
 # Cap on Orchestrator.pending_insights — see its declaration in __init__ for why.
 _PENDING_INSIGHTS_MAX = 50
@@ -746,6 +756,68 @@ class Orchestrator:
             "tags": [],
         }
 
+    async def ask_knowledge_base(self, question: str, include_cloud: bool = False) -> dict:
+        """RAG Q&A over the stored knowledge base — retrieves once, then
+        answers with local (Ollama). Cloud (headless `claude -p`) only runs
+        when *include_cloud* is set, so the default path (dashboard, and
+        always for Telegram's /kb) never pays for a cloud call the user
+        didn't ask for — see the 2026-10-05 decision to default to local-only
+        and treat cloud as opt-in per question.
+
+        Unlike :meth:`ask_claude`, this never persists a Document — it's a
+        query tool, not an archive entry.
+        """
+        import time
+
+        from backend.knowledge import rag
+        from backend.tasks.claude_chat import ask_claude_with_context
+
+        async with self._session_maker() as db:
+            context_text, sources = await rag.build_context(
+                db, self.model_router, self.qdrant, question
+            )
+
+        sources_out = [
+            {"doc_id": s.doc_id, "title": s.title, "score": s.score, "created_at": s.created_at}
+            for s in sources
+        ]
+
+        if context_text is None:
+            empty = {"answer": None, "model": None, "latency_ms": None,
+                     "error": "知識庫裡沒有找到相關資訊。"}
+            return {"sources": sources_out, "local": empty, "cloud": dict(empty) if include_cloud else None}
+
+        prompt = rag.build_prompt(question, context_text)
+
+        async def _run_local() -> dict:
+            start = time.monotonic()
+            try:
+                answer, model = await self.model_router.chat_with_meta(
+                    "rag_local", [{"role": "user", "content": prompt}]
+                )
+                return {
+                    "answer": answer, "model": model,
+                    "latency_ms": int((time.monotonic() - start) * 1000), "error": None,
+                }
+            except AllProvidersFailedError as exc:
+                return {"answer": None, "model": None, "latency_ms": None, "error": str(exc)}
+
+        async def _run_cloud() -> dict:
+            start = time.monotonic()
+            result = await ask_claude_with_context(prompt)
+            latency_ms = int((time.monotonic() - start) * 1000)
+            if not result["ok"]:
+                return {"answer": None, "model": None, "latency_ms": latency_ms, "error": result["error"]}
+            return {"answer": result["answer"], "model": "claude", "latency_ms": latency_ms, "error": None}
+
+        if include_cloud:
+            local_result, cloud_result = await asyncio.gather(_run_local(), _run_cloud())
+        else:
+            local_result = await _run_local()
+            cloud_result = None
+
+        return {"sources": sources_out, "local": local_result, "cloud": cloud_result}
+
     async def preview_insight(self, url: str) -> dict:
         """Fetch *url* and extract "what is the author actually arguing,"
         WITHOUT persisting anything — no Document row is created here. The
@@ -1386,19 +1458,27 @@ class Orchestrator:
         processed: Any,
         max_retries: int = _MAX_RETRIES,
     ) -> dict:
-        """Call _execute_agent with exponential back-off retry on transient failures."""
+        """Call _execute_agent with exponential back-off retry on transient failures.
+
+        Raises AgentExecutionFailedError once retries are exhausted, rather
+        than falling back to a placeholder result — the caller (ultimately
+        _route_and_finalize/confirm_routing) already catches this and marks
+        the document 'failed', which is what lets retry_document() pick it
+        back up later. Silently swallowing this into a 'completed' document
+        with a generic placeholder summary/category made the failure
+        invisible and permanently unretryable.
+        """
         last_exc: Exception | None = None
         for attempt in range(max_retries + 1):
             try:
                 return await self._execute_agent(skill, processed)
-            except AllProvidersFailedError as exc:
+            except (AllProvidersFailedError, AgentExecutionFailedError) as exc:
                 last_exc = exc
                 if attempt < max_retries:
                     delay = _RETRY_DELAY * (2 ** attempt)
                     logger.warning(
-                        "Agent '{}' attempt {}/{} failed (AllProvidersFailedError). "
-                        "Retrying in {:.1f}s…",
-                        skill.name, attempt + 1, max_retries + 1, delay,
+                        "Agent '{}' attempt {}/{} failed ({}). Retrying in {:.1f}s…",
+                        skill.name, attempt + 1, max_retries + 1, type(exc).__name__, delay,
                     )
                     await asyncio.sleep(delay)
             except Exception as exc:
@@ -1407,10 +1487,12 @@ class Orchestrator:
                 raise
 
         logger.error(
-            "Agent '{}' exhausted {} retries. Using fallback output.",
+            "Agent '{}' exhausted {} retries.",
             skill.name, max_retries,
         )
-        return self._fallback_result(processed)
+        raise AgentExecutionFailedError(
+            f"Agent '{skill.name}' exhausted {max_retries} retries: {last_exc}"
+        ) from last_exc
 
     async def _execute_agent(self, skill: SkillDefinition, processed: Any) -> dict:
         """Run the actual agent work: call the LLM and extract structured output.
@@ -1452,8 +1534,13 @@ class Orchestrator:
                 return normalize_agent_output(skill.output_schema, parsed)
             except json.JSONDecodeError as exc:
                 logger.warning("Agent '{}' returned invalid JSON: {}", skill.name, exc)
+                raise AgentExecutionFailedError(
+                    f"Agent '{skill.name}' returned invalid JSON: {exc}"
+                ) from exc
 
-        return self._fallback_result(processed)
+        raise AgentExecutionFailedError(
+            f"Agent '{skill.name}' response contained no JSON object. Raw preview: {raw[:200]!r}"
+        )
 
     # ------------------------------------------------------------------
     # Post-processing
@@ -1565,31 +1652,43 @@ class Orchestrator:
     ) -> tuple[str | None, float]:
         """Choose the best-matching project using LLM + existing project list.
 
-        Falls back to the agent's own suggestion when the LLM call fails or
-        when no projects exist yet. Does **not** decide whether to auto-link,
-        ask for confirmation, or skip — that confidence-tiering decision is
-        made by the caller (:meth:`_execute_and_save`) using the same
+        Falls back to the agent's own suggestion when the LLM call fails.
+        Does **not** decide whether to auto-link, ask for confirmation, or
+        skip — that confidence-tiering decision is made by the caller
+        (:meth:`_execute_and_save`) using the same
         ``_AUTO_THRESHOLD``/``_CONFIRM_THRESHOLD`` bands as agent routing.
 
         Returns ``(project_name, confidence)`` — ``project_name`` is ``None``
         when no candidate was found at all.
+
+        Previously this returned the agent's own suggestion directly
+        whenever no `Project` rows existed yet, skipping the LLM call
+        entirely — but no agent's SKILL.md output_schema actually populates
+        `suggested_project`/`project_confidence` (those are this method's
+        own concept, not the per-type agents'), so that fallback was always
+        ``(None, 0.0)``. With zero projects ever created, that condition
+        could never become false — a permanent chicken-and-egg deadlock
+        that kept the `projects` table empty no matter how many documents
+        came in. The LLM call now always runs, including with an empty
+        project list, so it can bootstrap the first project itself.
         """
-        # The agent may have already suggested a project.
+        # The agent may have already suggested a project (currently never
+        # populated by any agent, but kept as a last-resort fallback below
+        # in case a future agent's SKILL.md adds it).
         agent_suggestion = agent_result.get("suggested_project")
         agent_confidence = float(agent_result.get("project_confidence") or 0.0)
 
-        # Fetch active projects to ground the classification.
         try:
             existing_projects = await crud.get_projects(db)
         except Exception as exc:
             logger.warning("Could not fetch project list: {}; using agent suggestion.", exc)
             return agent_suggestion, agent_confidence
 
-        # If no projects exist yet, trust the agent directly (it will create one).
-        if not existing_projects:
-            return agent_suggestion, agent_confidence
-
-        project_list = "\n".join(f"- {p.name}" for p in existing_projects)
+        project_list = (
+            "\n".join(f"- {p.name}" for p in existing_projects)
+            if existing_projects
+            else "(目前沒有任何專案，如果這份內容屬於一個有意義、可能還會再出現的主題，可以提出一個新名稱)"
+        )
         summary = agent_result.get("summary", "")
         content_snippet = (processed.original_content or "")[:300]
 
@@ -1602,7 +1701,11 @@ class Orchestrator:
             "Respond with ONLY valid JSON (no markdown fences):\n"
             '{"project_name": "<exact name from list, or a new name, or null>", '
             '"confidence": <0.0-1.0>}\n'
-            "Return null for project_name if this document does not clearly belong to any project."
+            "Prefer an exact name from the existing list when this document clearly "
+            "continues an existing topic. Only propose a new name when the document "
+            "represents a distinct, recurring topic/project of its own, not a one-off "
+            "piece of miscellaneous reading. Return null for project_name if this "
+            "document does not clearly belong to any coherent project or topic."
         )
 
         try:
@@ -1676,16 +1779,3 @@ class Orchestrator:
             "text":     "note",
         }
         return mapping.get(input_type.lower(), input_type.lower())
-
-    @staticmethod
-    def _fallback_result(processed: Any) -> dict:
-        """Minimal structured output used when the LLM agent call fails entirely."""
-        snippet = (processed.original_content or "")[:200]
-        return {
-            "summary": snippet,
-            "category": "General",
-            "suggested_tags": [],
-            "suggested_project": None,
-            "project_confidence": 0.0,
-            "type_specific_data": {},
-        }
