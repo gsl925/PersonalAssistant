@@ -149,6 +149,10 @@ export const api = {
     });
   },
 
+  getLocalModels(): Promise<OllamaModelsResponse> {
+    return request(`/api/settings/local-models`);
+  },
+
   getOllamaModels(): Promise<OllamaModelsResponse> {
     return request(`/api/settings/ollama-models`);
   },

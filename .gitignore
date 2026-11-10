@@ -79,3 +79,6 @@ desktop/out/
 *.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
+
+# === llama.cpp / llama-swap 免安裝執行檔（download_binaries.ps1 下載，不進版控）===
+tools/llama/bin/

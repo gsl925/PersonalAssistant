@@ -1,4 +1,4 @@
-"""Settings API router — manage capability tiers and query available Ollama models."""
+"""Settings API router — manage capability tiers and query available local models."""
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +8,13 @@ from fastapi import APIRouter, HTTPException, status
 from loguru import logger
 from pydantic import BaseModel
 
-from backend.config import CapabilityTiers, settings
+from backend.config import (
+    CapabilityTiers,
+    normalize_capability_tiers,
+    save_capability_tiers,
+    settings,
+)
+from backend.model_router import resolve_provider
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -77,12 +83,12 @@ async def get_capability_tiers() -> CapabilityTiersResponse:
 async def update_capability_tiers(
     body: CapabilityTiersPatchRequest,
 ) -> CapabilityTiersResponse:
-    """Overwrite capability tier config in-process.
+    """Overwrite capability tier config.
 
-    This updates the live ``settings.CAPABILITY_TIERS`` dict and re-initialises
-    the ModelRouter so subsequent requests use the new chain.  The change is
-    ephemeral — it will revert on server restart unless you also update your
-    ``.env`` / environment variables.
+    Saves the tiers to ``settings.CAPABILITY_TIERS_PATH`` (so they survive a
+    restart), then updates the live ``settings.CAPABILITY_TIERS`` dict and the
+    ModelRouter so subsequent requests use the new chain. Legacy provider
+    names ("ollama_local") are rewritten to "local".
     """
     from backend.main import get_model_router
 
@@ -100,6 +106,17 @@ async def update_capability_tiers(
                     detail=f"Each entry in tier '{tier_name}' must have 'provider' and 'model' keys.",
                 )
         new_tiers[tier_name] = chain
+
+    new_tiers = normalize_capability_tiers(new_tiers)
+
+    # Save first: if the write fails nothing has changed in memory either.
+    try:
+        save_capability_tiers(new_tiers)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not save {settings.CAPABILITY_TIERS_PATH}: {exc}",
+        ) from exc
 
     # Update the singleton settings object.
     settings.CAPABILITY_TIERS = new_tiers  # type: ignore[assignment]
@@ -170,10 +187,41 @@ async def digest_status() -> DigestStatusResponse:
     return DigestStatusResponse(**get_digest_status())
 
 
+@router.get("/local-models", response_model=OllamaModelsResponse)
+async def list_local_models() -> OllamaModelsResponse:
+    """List the models the configured local LLM server offers, via the
+    OpenAI-compatible ``/v1/models`` (served by llama-server/llama-swap and
+    Ollama alike)."""
+    base_url = settings.local_base_url.rstrip("/")
+    url = f"{base_url}/v1/models"
+
+    logger.debug("Fetching local model list from {}", url)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Cannot reach local LLM server at {base_url}: {exc}",
+        ) from exc
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Local LLM server returned HTTP {resp.status_code}",
+        )
+
+    models = [OllamaModel(name=m["id"]) for m in resp.json().get("data", []) if m.get("id")]
+    logger.info("Local LLM server reports {} model(s)", len(models))
+    return OllamaModelsResponse(models=models)
+
+
 @router.get("/ollama-models", response_model=OllamaModelsResponse)
 async def list_ollama_models() -> OllamaModelsResponse:
-    """Query the local Ollama instance and return the list of installed models."""
-    base_url = settings.OLLAMA_LOCAL_BASE_URL.rstrip("/")
+    """Query the local Ollama instance (native ``/api/tags``) and return its
+    installed models. Kept for the dev-agent model picker, which still talks
+    to Ollama's native API; the settings page uses ``/local-models``."""
+    base_url = settings.local_base_url.rstrip("/")
     url = f"{base_url}/api/tags"
 
     logger.debug("Fetching Ollama model list from {}", url)
@@ -215,13 +263,9 @@ async def test_model(body: TestModelRequest) -> TestModelResponse:
     ``false`` otherwise — never raises an HTTP error so callers can handle
     partial availability gracefully.
     """
-    if body.provider == "ollama_local":
-        base_url = settings.OLLAMA_LOCAL_BASE_URL
-        api_key = ""
-    elif body.provider == "ollama_cloud":
-        base_url = settings.OLLAMA_CLOUD_BASE_URL
-        api_key = settings.OLLAMA_CLOUD_API_KEY
-    else:
+    try:
+        base_url, api_key = resolve_provider(body.provider)
+    except ValueError:
         return TestModelResponse(
             provider=body.provider,
             model=body.model,

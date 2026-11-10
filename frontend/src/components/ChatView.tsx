@@ -84,7 +84,7 @@ export default function ChatView() {
       <div style={{ marginBottom: 24, paddingBottom: 16, borderBottom: "1px solid var(--border, #ddd)" }}>
         <h3 style={{ fontSize: 14, marginTop: 0 }}>知識庫問答</h3>
         <p className="muted" style={{ fontSize: 12 }}>
-          只根據你存進知識庫的內容回答，不會上網查。預設只問 local（Ollama，目前是 gemma4:26b），勾選下面的選項才會同時問 cloud（Claude）方便比較。不會存成問答記錄。
+          只根據你存進知識庫的內容回答，不會上網查。預設只問 local（本地模型，目前是 gemma4:26b），勾選下面的選項才會同時問 cloud（Claude）方便比較。不會存成問答記錄。
         </p>
         <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
           <input
