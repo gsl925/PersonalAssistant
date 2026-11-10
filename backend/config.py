@@ -40,15 +40,18 @@ DEFAULT_CAPABILITY_TIERS: CapabilityTiers = {
         {"provider": "local", "model": "llava:7b"},
     ],
     # Literal text transcription (screenshot-agent's OCR step). Separate from
-    # "vision" above — general VLMs (qwen3-vl, llava) confabulate a plausible
-    # but fictional narrative on dense/small-text screenshots instead of
-    # admitting they can't read it; minicpm-v is specifically OCR-tuned and
-    # stayed grounded in the real content on the same test image (live-tested
-    # 2026-07-28 against a real dense screenshot — qwen3-vl/deepseek-ocr both
-    # invented entirely fictional content, minicpm-v got most of it right).
+    # "vision" above. Order flipped 2026-11-10 after moving to llama.cpp: on
+    # Ollama (2026-07-28, a dense real screenshot) qwen3-vl/deepseek-ocr
+    # invented fictional content while minicpm-v stayed grounded; on llama.cpp
+    # with this exact OCR prompt and a dense project-tracker screenshot,
+    # qwen3-vl read 15/18 probe strings verbatim while minicpm-v got 12/18 and
+    # paraphrased the rest (and looped on a different prompt). The two engines
+    # disagree, so re-test with a few real screenshots if OCR quality matters
+    # — note the default OCR engine is tesseract (SCREENSHOT_OCR_ENGINE), so
+    # this tier only runs when that is set to "vlm".
     "ocr": [
-        {"provider": "local", "model": "minicpm-v:8b"},
         {"provider": "local", "model": "qwen3-vl:8b"},
+        {"provider": "local", "model": "minicpm-v:8b"},
     ],
     "embedding": [
         {"provider": "local", "model": "bge-m3"},
@@ -77,8 +80,13 @@ DEFAULT_CAPABILITY_TIERS: CapabilityTiers = {
     # real point (e.g. caught a "discoverability" angle deepseek-r1:14b's
     # output missed entirely). It was dropped from the chain when the app went
     # local-only (a "-cloud" model is only reachable through a local Ollama
-    # daemon), so deepseek-r1:14b is now the only entry.
+    # daemon). Local replacement chosen 2026-11-10 from a 5-article A/B of the
+    # real insight prompt: gemma4:26b wrote all 5 in Traditional Chinese and
+    # stated the author's stance rather than restating the content, while
+    # deepseek-r1:14b slipped into Simplified Chinese on 2 of 5 (~2x faster,
+    # so it stays as the fallback).
     "insight_extraction": [
+        {"provider": "local", "model": "gemma4:26b"},
         {"provider": "local", "model": "deepseek-r1:14b"},
     ],
     # Video digest (backend/video_digest.py): deliberately single-entry, no
