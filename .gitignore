@@ -82,3 +82,6 @@ frontend/vite.config.d.ts
 
 # === llama.cpp / llama-swap 免安裝執行檔（download_binaries.ps1 下載，不進版控）===
 tools/llama/bin/
+
+# 本機 LLM 引擎遷移的設計紀錄：只留在本機，不公開
+DESIGN_本機LLM引擎遷移_llama.cpp.md

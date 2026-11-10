@@ -10,7 +10,7 @@
 - **LLM**: 純本機推理，兩種引擎二選一，由 `.env` 的 `LOCAL_LLM_ENGINE` 決定：
   - `llama`（預設）：llama.cpp + llama-swap，免安裝，見 [`tools/llama/README.md`](tools/llama/README.md)
   - `ollama`：必須明確設定才會使用，不會是沒設定時的退路
-  - 兩邊的模型名稱一致，所以 capability tier 設定共用。設計與踩坑紀錄見 [`DESIGN_本機LLM引擎遷移_llama.cpp.md`](DESIGN_本機LLM引擎遷移_llama.cpp.md)
+  - 兩邊的模型名稱一致，所以 capability tier 設定共用
   - 預設 tier 全是本機模型；`-cloud` 後綴的 Ollama 雲端模型已不在預設裡（它們只能透過本機 Ollama daemon 轉送）
 - **語音轉文字**: faster-whisper（CPU）
 - **6 個 agent**（`skills/*/SKILL.md`）：document / note / meeting / screenshot / webclip / dev（dev-agent 預設關閉）
