@@ -1,6 +1,7 @@
 @echo off
 REM Starts everything that does NOT auto-start on boot:
 REM   - Qdrant (vector DB)
+REM   - llama-swap (local LLM server; only if tools\llama\bin was downloaded)
 REM   - Personal AI Assistant backend (FastAPI + Telegram bot + APScheduler + Dashboard)
 REM   - Dashboard, opened in the default browser (served by the backend at /dashboard)
 REM   - Desktop widget (Electron tray app: Ctrl+Shift+S screenshot, Ctrl+Shift+N note)
@@ -14,6 +15,11 @@ start "Qdrant" cmd /k "tools\qdrant\start_qdrant.bat"
 
 echo Waiting for Qdrant to come up...
 timeout /t 5 /nobreak >nul
+
+if exist "tools\llama\bin\llama-swap\llama-swap.exe" (
+    echo Starting llama-swap ^(local LLM server on :8090^)...
+    start "llama-swap" cmd /k "%~dp0tools\llama\start_llama.bat"
+)
 
 echo Starting Personal AI Assistant (FastAPI + Telegram bot)...
 start "Personal AI Assistant" cmd /k "%~dp0tools\start_backend.bat"
@@ -30,6 +36,7 @@ start "Desktop Widget" cmd /k "%~dp0tools\start_widget.bat"
 echo.
 echo All services launched in separate windows:
 echo   - Qdrant            (http://localhost:6333)
+echo   - llama-swap         (http://localhost:8090, if installed)
 echo   - Personal Assistant (http://localhost:8000/api/docs)
 echo   - Dashboard          (http://localhost:8000/dashboard/) - opened in browser
 echo   - Desktop Widget     (system tray icon; Ctrl+Shift+S screenshot, Ctrl+Shift+N note)

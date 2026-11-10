@@ -31,6 +31,38 @@ _TARGET_PROJECT = "factory-tools"
 DbDep = Annotated[AsyncSession, Depends(get_db)]
 
 
+def _validate_reference_path(reference_path: str) -> None:
+    """Pre-flight fail-fast check for a submitted reference_path, before
+    writing anything or spending a single model token. The Cinebench
+    incident (2026-09-09) burned a full 30-step/30-min run to discover the
+    reference folder had been moved — that's a plain existence check, not
+    something the model needed to figure out. Raises HTTPException(422) on
+    any problem.
+
+    Accepts either a directory (the original case) or a single file — a
+    user pointing dev-agent at one specific reference file (e.g. one log
+    file, not a folder of them) is legitimate; dev_agent.py's sandbox falls
+    back to that file's parent directory as the 'ref:' root in that case.
+    """
+    ref = Path(reference_path)
+    if not ref.exists():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"參考路徑不存在：{reference_path}",
+        )
+    if ref.is_dir():
+        if not any(p.is_file() for p in ref.rglob("*")):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"參考路徑底下沒有任何檔案：{reference_path}",
+            )
+    elif not ref.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"參考路徑不是檔案或資料夾：{reference_path}",
+        )
+
+
 def _factory_tools_repo_path() -> Path:
     project = next((p for p in load_tracked_projects() if p.name == _TARGET_PROJECT), None)
     if project is None:
@@ -157,24 +189,9 @@ async def submit_dev_task(body: DevTaskSubmitRequest, db: DbDep) -> DevTaskSubmi
             detail="description must not be empty",
         )
 
-    # Pre-flight fail-fast: catch structurally-detectable problems before
-    # writing anything or spending a single model token. The Cinebench
-    # incident (2026-09-09) burned a full 30-step/30-min run to discover the
-    # reference folder had been moved — that's a plain existence check, not
-    # something the model needed to figure out.
     reference_path = body.reference_path.strip() if body.reference_path else None
     if reference_path:
-        ref = Path(reference_path)
-        if not ref.exists() or not ref.is_dir():
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"參考路徑不存在或不是資料夾：{reference_path}",
-            )
-        if not any(p.is_file() for p in ref.rglob("*")):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"參考路徑底下沒有任何檔案：{reference_path}",
-            )
+        _validate_reference_path(reference_path)
 
     if body.target_tool:
         existing_tools = await crud.list_tools(db)

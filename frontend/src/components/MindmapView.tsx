@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 import type { Document, MindmapResponse } from "../api/types";
+import DocumentDetail from "./DocumentDetail";
 
 const RELATION_COLOR: Record<string, string> = {
   semantic: "#3b6fd9",
@@ -25,6 +26,39 @@ export default function MindmapView() {
   const [error, setError] = useState<string | null>(null);
   const [recent, setRecent] = useState<Document[]>([]);
   const svgRef = useRef<SVGSVGElement>(null);
+
+  // Selecting a node (click) no longer jumps straight to an action — with
+  // many related articles the small, crowded circles make a precise
+  // double-click or "click = recenter" unreliable. Instead selection opens
+  // a fixed-position panel (full title, not the truncated graph label) with
+  // explicit buttons, so the target you act on is always a big stationary
+  // button rather than the tiny node itself.
+  const [selectedNode, setSelectedNode] = useState<
+    { id: string; title: string; source_type: string } | null
+  >(null);
+  const [openDoc, setOpenDoc] = useState<Document | null>(null);
+  const [openDocLoading, setOpenDocLoading] = useState(false);
+  const [openDocError, setOpenDocError] = useState<string | null>(null);
+
+  async function handleOpenArticle() {
+    if (!selectedNode) return;
+    setOpenDocLoading(true);
+    setOpenDocError(null);
+    try {
+      const doc = await api.getDocument(selectedNode.id);
+      setOpenDoc(doc);
+    } catch (e) {
+      setOpenDocError(e instanceof Error ? e.message : "找不到這份文件");
+    } finally {
+      setOpenDocLoading(false);
+    }
+  }
+
+  function handleRecenter() {
+    if (!selectedNode) return;
+    setSearchParams({ doc: selectedNode.id });
+    setSelectedNode(null);
+  }
 
   useEffect(() => {
     if (centerId) return;
@@ -63,6 +97,10 @@ export default function MindmapView() {
     }, 300);
     return () => clearTimeout(handle);
   }, [query]);
+
+  useEffect(() => {
+    setSelectedNode(null);
+  }, [mindmap?.center_id]);
 
   useEffect(() => {
     if (!mindmap || !svgRef.current) return;
@@ -140,11 +178,12 @@ export default function MindmapView() {
           })
       )
       .on("click", (_event, d) => {
-        setSearchParams({ doc: d.id });
+        setSelectedNode({ id: d.id, title: d.title, source_type: d.source_type });
       });
 
     node
       .append("circle")
+      .attr("class", "mindmap-node-circle")
       .attr("r", (d) => (d.isCenter ? 16 : 10))
       .attr("fill", (d) => (d.isCenter ? "#3b6fd9" : "#8b93a7"))
       .attr("stroke", "#fff")
@@ -172,6 +211,17 @@ export default function MindmapView() {
       simulation.stop();
     };
   }, [mindmap, setSearchParams]);
+
+  // Highlights the selected node's circle in place (no simulation restart)
+  // so it's obvious which node the floating panel below refers to — matters
+  // most exactly when many nodes are crowded together and look alike.
+  useEffect(() => {
+    if (!svgRef.current) return;
+    d3.select(svgRef.current)
+      .selectAll<SVGCircleElement, SimNode>(".mindmap-node-circle")
+      .attr("stroke", (d) => (d.id === selectedNode?.id ? "#e0a13b" : "#fff"))
+      .attr("stroke-width", (d) => (d.id === selectedNode?.id ? 3 : 1.5));
+  }, [selectedNode, mindmap]);
 
   return (
     <div>
@@ -230,13 +280,53 @@ export default function MindmapView() {
       {error && <p style={{ color: "var(--danger)" }}>{error}</p>}
 
       {centerId && (
-        <svg
-          ref={svgRef}
-          width="100%"
-          height={560}
-          style={{ border: "1px solid var(--border)", borderRadius: 8 }}
-        />
+        <div style={{ position: "relative" }}>
+          <svg
+            ref={svgRef}
+            width="100%"
+            height={560}
+            style={{ border: "1px solid var(--border)", borderRadius: 8 }}
+          />
+
+          {selectedNode && (
+            <div
+              className="card"
+              style={{
+                position: "absolute",
+                top: 12,
+                right: 12,
+                maxWidth: 280,
+                padding: 12,
+                boxShadow: "0 2px 10px rgba(0,0,0,0.15)",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                <div style={{ fontWeight: 600, fontSize: 13 }}>{selectedNode.title}</div>
+                <button
+                  onClick={() => setSelectedNode(null)}
+                  style={{ border: "none", background: "none", cursor: "pointer", padding: 0 }}
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="muted" style={{ fontSize: 12, margin: "4px 0 10px" }}>
+                {selectedNode.source_type}
+              </div>
+              {openDocError && (
+                <p style={{ color: "var(--danger)", fontSize: 12 }}>{openDocError}</p>
+              )}
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <button onClick={handleOpenArticle} disabled={openDocLoading}>
+                  {openDocLoading ? "開啟中…" : "開啟文章內容"}
+                </button>
+                <button onClick={handleRecenter}>以此為中心重新檢視關聯</button>
+              </div>
+            </div>
+          )}
+        </div>
       )}
+
+      {openDoc && <DocumentDetail doc={openDoc} onClose={() => setOpenDoc(null)} />}
     </div>
   );
 }

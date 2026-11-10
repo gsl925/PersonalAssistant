@@ -57,6 +57,31 @@ def _uploads_dir() -> Path:
     return path
 
 
+# Matches the "#project-slug" hashtag project_sync.py tags each relayed
+# PROGRESS.md message with — a reply containing it gets written into that
+# project's "📮 你的指示" section. See SDD_PROGRESS_SYNC.md.
+_PROJECT_HASHTAG_PATTERN = re.compile(r"#([a-zA-Z0-9\-]+)")
+
+
+def _find_project_hashtag(text: str, tracked_projects: list) -> tuple[Any, Any]:
+    """Scan every "#token" in *text* and return the (match, project) for the
+    first one that's an actual tracked project slug, or (None, None).
+
+    A reply often carries more than one hashtag-looking token — e.g. "#23
+    好 #genai-news" (an item number plus the project tag copied from the
+    relayed message). Just taking the first "#..." match (the old
+    behaviour) usually grabbed the item number, not the project slug,
+    which isn't a tracked project — misrouting the whole reply to "fall
+    through to normal classification" and silently losing it.
+    """
+    for candidate in _PROJECT_HASHTAG_PATTERN.finditer(text):
+        candidate_name = candidate.group(1).lower()
+        found = next((p for p in tracked_projects if p.name == candidate_name), None)
+        if found is not None:
+            return candidate, found
+    return None, None
+
+
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 _AUDIO_MIME_SUFFIX: dict[str, str] = {
@@ -117,6 +142,7 @@ class PersonalAssistantBot:
         add(CommandHandler("status", self.handle_status))
         add(CommandHandler("todo", self.handle_todo_command))
         add(CommandHandler("ask", self.handle_ask_command))
+        add(CommandHandler("kb", self.handle_kb_command))
         add(CommandHandler("insight", self.handle_insight_command))
         add(CommandHandler("wake", self.handle_wake_command))
         add(CommandHandler("projects", self.handle_projects_command))
@@ -162,6 +188,8 @@ class PersonalAssistantBot:
             f"點下方的「{self._QUICK_TODO_BUTTON_TEXT}」按鈕，或直接輸入 /todo 內容，"
             "可以明確新增一筆代辦（不用等我猜）。\n\n"
             "跟專案無關、單純想問問題的話，用 /ask 你的問題。\n\n"
+            "想針對你存在知識庫裡的內容問問題，用 /kb 你的問題。\n\n"
+            "想先看一篇文章「作者到底想表達什麼」再決定要不要收藏，用 /insight <網址>。\n\n"
             "使用 /status 查看目前狀態。"
         )
         keyboard = ReplyKeyboardMarkup(
@@ -225,6 +253,39 @@ class PersonalAssistantBot:
         except Exception as exc:
             logger.exception("handle_ask_command error: {}", exc)
             await thinking_msg.edit_text(f"❌ 回答時發生錯誤：{exc}")
+
+    async def handle_kb_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """``/kb <question>`` — RAG Q&A over the saved knowledge base, local
+        (Ollama) only. Unlike ``/ask``, this only answers from what's
+        actually stored — see Orchestrator.ask_knowledge_base(). Cloud
+        comparison stays a dashboard-only feature (that's a testing tool,
+        not something worth the extra wait on a quick phone query)."""
+        self._cache_chat_id(update)
+        question = " ".join(context.args or []).strip()
+        if not question:
+            await update.message.reply_text("用法：/kb 你的問題，例如 /kb 我上次存的那篇文章在講什麼")
+            return
+
+        thinking_msg = await update.message.reply_text("🔍 查知識庫中…")
+        try:
+            result = await self.orchestrator.ask_knowledge_base(question)
+            local = result["local"]
+            if local.get("error"):
+                await thinking_msg.edit_text(f"❌ {local['error']}")
+                return
+            text = local["answer"]
+            if result["sources"]:
+                refs = "、".join(
+                    f"[{i + 1}] {s['title'] or '(未命名)'}"
+                    for i, s in enumerate(result["sources"])
+                )
+                text = f"{text}\n\n📚 參考來源：{refs}"
+            await thinking_msg.edit_text(text[:4096])
+        except Exception as exc:
+            logger.exception("handle_kb_command error: {}", exc)
+            await thinking_msg.edit_text(f"❌ 查詢時發生錯誤：{exc}")
 
     async def handle_insight_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -502,10 +563,6 @@ class PersonalAssistantBot:
     # ------------------------------------------------------------------
 
     _TODO_INTENT_PATTERN = re.compile(r"代辦|待辦|todo|to-do|action[\s-]?items?", re.IGNORECASE)
-    # Matches the "#project-slug" hashtag project_sync.py tags each relayed
-    # PROGRESS.md message with — a reply containing it gets written into
-    # that project's "📮 你的指示" section. See SDD_PROGRESS_SYNC.md.
-    _PROJECT_HASHTAG_PATTERN = re.compile(r"#([a-zA-Z0-9\-]+)")
     # "現在有哪些專案被觀察/追蹤" style queries — see _reply_projects_overview.
     _PROJECTS_QUERY_PATTERN = re.compile(
         r"(哪些|哪個|which)[^\n]{0,10}(專案|project)|(專案|project)[^\n]{0,10}(觀察|追蹤|監控|清單|list|watch)",
@@ -550,31 +607,35 @@ class PersonalAssistantBot:
                 await update.message.reply_text(self._format_todo_created(result))
                 return
 
-            hashtag_match = self._PROJECT_HASHTAG_PATTERN.search(text)
+            # A reply often carries more than one "#token" — e.g. "#23 好
+            # #genai-news" (an item number plus the project tag copied from
+            # the relayed message). .search() alone always grabbed the
+            # first one, which is usually the item number, not a project
+            # slug — misrouting the whole reply to "fall through to normal
+            # classification" and losing it. Scan every hashtag and use the
+            # first one that's an actual tracked project.
+            from backend.config import load_tracked_projects
+
+            hashtag_match, project = _find_project_hashtag(text, load_tracked_projects())
+
             if hashtag_match:
-                from backend.config import load_tracked_projects
+                # PA never executes anything itself — this just relays the
+                # reply into that project's PROGRESS.md ("📮 你的指示"); the
+                # project's own Claude Code session picks it up from there
+                # (see SDD_PROGRESS_SYNC.md). Plain file write, so no
+                # background task/timeout handling needed.
                 from backend.tasks.project_sync import write_instruction
 
-                project_name = hashtag_match.group(1).lower()
-                project = next(
-                    (p for p in load_tracked_projects() if p.name == project_name), None
-                )
-                if project is not None:
-                    # PA never executes anything itself — this just relays
-                    # the reply into that project's PROGRESS.md ("📮 你的指示");
-                    # the project's own Claude Code session picks it up from
-                    # there (see SDD_PROGRESS_SYNC.md). Plain file write, so
-                    # no background task/timeout handling needed.
-                    remainder = (text[: hashtag_match.start()] + text[hashtag_match.end() :]).strip()
-                    ok = await write_instruction(project_name, remainder)
-                    if ok:
-                        await update.message.reply_text(f"✅ 已記錄，會轉達給「{project.label}」")
-                    else:
-                        await update.message.reply_text(
-                            f"❌ 「{project.label}」還沒有 PROGRESS.md，無法轉達。"
-                        )
-                    return
-                # Unrecognised hashtag — fall through to normal classification.
+                remainder = (text[: hashtag_match.start()] + text[hashtag_match.end() :]).strip()
+                ok = await write_instruction(project.name, remainder)
+                if ok:
+                    await update.message.reply_text(f"✅ 已記錄，會轉達給「{project.label}」")
+                else:
+                    await update.message.reply_text(
+                        f"❌ 「{project.label}」還沒有 PROGRESS.md，無法轉達。"
+                    )
+                return
+            # No hashtag matched a tracked project — fall through to normal classification.
 
             if text.startswith("http://") or text.startswith("https://"):
                 await update.message.reply_text("🔗 連結已收到，正在處理...")
@@ -626,7 +687,7 @@ class PersonalAssistantBot:
     ) -> None:
         """Handle inline button presses.
 
-        Four independent callback_data formats share this handler:
+        Independent callback_data formats share this handler:
           - ``confirm:{doc_id}:{agent_name}``   — agent-routing confirmation
           - ``project:{doc_id}:{project_name}`` — project-assignment confirmation
             (``project_name`` may be the sentinel ``__skip__`` for "不歸類")
@@ -637,6 +698,10 @@ class PersonalAssistantBot:
           - ``insight:{preview_id}:save`` — save button on an ``/insight``
             preview (see handle_insight_command); the only action, since
             "don't save" just means never tapping this button
+          - ``discuss:{project_name}#{item_number}:{ok|no|defer}`` — quick-reply
+            button on a relayed cross-project "💬" decision item (see
+            project_sync.py::_relay_discuss_items); a canned-text equivalent
+            of typing e.g. "1 好，照做" — free-text replies still work too.
         """
         query = update.callback_query
         await query.answer()
@@ -644,12 +709,35 @@ class PersonalAssistantBot:
         data: str = query.data or ""
         parts = data.split(":", 2)
 
-        if len(parts) != 3 or parts[0] not in ("confirm", "project", "todo", "remind", "insight"):
+        if len(parts) != 3 or parts[0] not in ("confirm", "project", "todo", "remind", "insight", "discuss"):
             logger.warning("Unrecognised callback_data: {!r}", data)
             await query.edit_message_text("❓ 無效的操作。")
             return
 
         kind, doc_id, payload = parts
+
+        if kind == "discuss":
+            project_name, _, number_str = doc_id.partition("#")
+            logger.info(
+                "Discuss quick-reply pressed: project={} item=#{} choice={}",
+                project_name, number_str, payload,
+            )
+            try:
+                from backend.tasks.project_sync import _DISCUSS_QUICK_REPLIES, write_instruction
+
+                reply_text = _DISCUSS_QUICK_REPLIES.get(payload)
+                if reply_text is None:
+                    await query.edit_message_text("❓ 無效的操作。")
+                    return
+                ok = await write_instruction(project_name, f"{number_str} {reply_text}")
+                if ok:
+                    await query.edit_message_text(f"✅ 已回覆「{reply_text}」，會轉達給該專案。")
+                else:
+                    await query.edit_message_text("❌ 該專案目前沒有 PROGRESS.md，無法轉達。")
+            except Exception as exc:
+                logger.exception("handle_callback (discuss) error: {}", exc)
+                await query.edit_message_text(f"❌ 回覆時發生錯誤：{exc}")
+            return
 
         if kind == "insight":
             preview_id = doc_id
@@ -746,6 +834,7 @@ class PersonalAssistantBot:
         self,
         text: str,
         parse_mode: str = ParseMode.MARKDOWN,
+        reply_markup: dict | None = None,
     ) -> None:
         """Push a message to the default chat.
 
@@ -753,6 +842,14 @@ class PersonalAssistantBot:
         Requires that at least one inbound message has been received first so that
         ``_default_chat_id`` is set, OR that ``settings.TELEGRAM_CHAT_ID`` is
         configured as a fallback.
+
+        *reply_markup*, if given, is the same plain-dict inline-keyboard shape
+        used elsewhere in this module (e.g. the todo-reminder buttons) and by
+        _send_telegram()'s raw httpx path in processing.py — not a
+        python-telegram-bot ``InlineKeyboardMarkup`` object — so callers
+        (notably project_sync.py's _send_relay) can build one keyboard shape
+        that works for both the PTB bot-object path here and the httpx
+        fallback. It's converted to ``InlineKeyboardMarkup`` below.
         """
         chat_id = self._default_chat_id or getattr(settings, "TELEGRAM_CHAT_ID", None)
         if not chat_id:
@@ -761,11 +858,20 @@ class PersonalAssistantBot:
                 "(set TELEGRAM_CHAT_ID in settings or send a /start message first)."
             )
             return
+        markup = None
+        if reply_markup is not None:
+            markup = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton(text=b["text"], callback_data=b["callback_data"]) for b in row]
+                    for row in reply_markup["inline_keyboard"]
+                ]
+            )
         try:
             await self.app.bot.send_message(
                 chat_id=chat_id,
                 text=text[:4096],
                 parse_mode=parse_mode,
+                reply_markup=markup,
             )
         except Exception as exc:
             # Callers (e.g. project_sync's relay) rely on this raising to
@@ -874,6 +980,7 @@ class PersonalAssistantBot:
             BotCommand("status", "查看系統狀態"),
             BotCommand("todo", "新增一筆代辦，例如 /todo 記得繳電費 8/5 前"),
             BotCommand("ask", "問 Claude 一個跟專案無關的問題，例如 /ask 台北明天天氣如何"),
+            BotCommand("kb", "針對你知識庫裡存的內容提問，例如 /kb 我上次存的那篇文章在講什麼"),
             BotCommand("insight", "看一篇文章/影片的核心洞察，例如 /insight https://example.com"),
             BotCommand("wake", "立刻叫醒一個專案去做事，例如 /wake genai-news 把今天新聞發到telegram"),
             BotCommand("projects", "查看目前追蹤的專案與待決策項目"),

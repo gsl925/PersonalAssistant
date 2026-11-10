@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-import yaml
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from ruamel.yaml import YAML
+
+# Round-trip loader/dumper — unlike PyYAML's safe_load/safe_dump, this
+# preserves hand-written comments (e.g. "auto_wake: false  # verified
+# working 2026-07-30...") across a load-then-dump cycle, so adding/removing
+# a tracked project no longer silently wipes out every comment in the file.
+_yaml = YAML()
+_yaml.preserve_quotes = True
+_yaml.indent(mapping=2, sequence=2, offset=0)
 
 
 # ---------------------------------------------------------------------------
@@ -21,30 +30,44 @@ CapabilityTiers = dict[str, list[dict[str, str]]]
 
 DEFAULT_CAPABILITY_TIERS: CapabilityTiers = {
     "fast_text": [
-        {"provider": "ollama_local", "model": "qwen3:8b"},
-        {"provider": "ollama_local", "model": "gpt-oss:120b-cloud"},
+        {"provider": "local", "model": "qwen3:8b"},
     ],
     "complex_reasoning": [
-        {"provider": "ollama_local", "model": "deepseek-r1:14b"},
-        {"provider": "ollama_local", "model": "gpt-oss:120b-cloud"},
+        {"provider": "local", "model": "deepseek-r1:14b"},
     ],
     "vision": [
-        {"provider": "ollama_local", "model": "qwen3-vl:8b"},
-        {"provider": "ollama_local", "model": "llava:7b"},
+        {"provider": "local", "model": "qwen3-vl:8b"},
+        {"provider": "local", "model": "llava:7b"},
     ],
     # Literal text transcription (screenshot-agent's OCR step). Separate from
-    # "vision" above — general VLMs (qwen3-vl, llava) confabulate a plausible
-    # but fictional narrative on dense/small-text screenshots instead of
-    # admitting they can't read it; minicpm-v is specifically OCR-tuned and
-    # stayed grounded in the real content on the same test image (live-tested
-    # 2026-07-28 against a real dense screenshot — qwen3-vl/deepseek-ocr both
-    # invented entirely fictional content, minicpm-v got most of it right).
+    # "vision" above. Order flipped 2026-11-10 after moving to llama.cpp: on
+    # Ollama (2026-07-28, a dense real screenshot) qwen3-vl/deepseek-ocr
+    # invented fictional content while minicpm-v stayed grounded; on llama.cpp
+    # with this exact OCR prompt and a dense project-tracker screenshot,
+    # qwen3-vl read 15/18 probe strings verbatim while minicpm-v got 12/18 and
+    # paraphrased the rest (and looped on a different prompt). The two engines
+    # disagree, so re-test with a few real screenshots if OCR quality matters
+    # — note the default OCR engine is tesseract (SCREENSHOT_OCR_ENGINE), so
+    # this tier only runs when that is set to "vlm".
     "ocr": [
-        {"provider": "ollama_local", "model": "minicpm-v:8b"},
-        {"provider": "ollama_local", "model": "qwen3-vl:8b"},
+        {"provider": "local", "model": "qwen3-vl:8b"},
+        {"provider": "local", "model": "minicpm-v:8b"},
     ],
     "embedding": [
-        {"provider": "ollama_local", "model": "bge-m3"},
+        {"provider": "local", "model": "bge-m3"},
+    ],
+    # Knowledge-base RAG answer generation (/api/chat/ask_kb, Telegram /kb) —
+    # this is the default path (cloud is opt-in per call). Local-only, so
+    # "local" results are never secretly cloud-assisted.
+    # gemma4:26b is primary: live-tested 2026-10-05 against
+    # qwen3:8b on the same question/context — 26b caught specific figures and
+    # ranges (e.g. "1%~5%") that 8b dropped, closer to Claude's detail level,
+    # at a real cost (~137s vs ~21s). qwen3:8b stays as the fast fallback.
+    # qwen3.8:27b was tried too and timed out past 180s on this hardware —
+    # not viable, so not included here.
+    "rag_local": [
+        {"provider": "local", "model": "gemma4:26b"},
+        {"provider": "local", "model": "qwen3:8b"},
     ],
     # "What is the author actually arguing" extraction (backend/insight.py) —
     # deliberately its own tier rather than reusing "complex_reasoning", since
@@ -55,13 +78,63 @@ DEFAULT_CAPABILITY_TIERS: CapabilityTiers = {
     # two TechNews articles (verified against the actual source text, not
     # just vibes): gpt-oss:120b-cloud consistently surfaced the article's
     # real point (e.g. caught a "discoverability" angle deepseek-r1:14b's
-    # output missed entirely), so it's primary despite deepseek-r1:14b being
-    # local/free — kept as fallback for when cloud is unavailable.
+    # output missed entirely). It was dropped from the chain when the app went
+    # local-only (a "-cloud" model is only reachable through a local Ollama
+    # daemon). Local replacement chosen 2026-11-10 from a 5-article A/B of the
+    # real insight prompt: gemma4:26b wrote all 5 in Traditional Chinese and
+    # stated the author's stance rather than restating the content, while
+    # deepseek-r1:14b slipped into Simplified Chinese on 2 of 5 (~2x faster,
+    # so it stays as the fallback).
     "insight_extraction": [
-        {"provider": "ollama_local", "model": "gpt-oss:120b-cloud"},
-        {"provider": "ollama_local", "model": "deepseek-r1:14b"},
+        {"provider": "local", "model": "gemma4:26b"},
+        {"provider": "local", "model": "deepseek-r1:14b"},
+    ],
+    # Video digest (backend/video_digest.py): deliberately single-entry, no
+    # fallback chain — unlike every tier above, this pair is called together
+    # (local draft vs. cloud draft, then Claude Code judges the two), so one
+    # tier silently falling back to the other model would defeat the whole
+    # point of comparing them. A model failing here is handled by
+    # video_digest.py itself (degrade to the other draft), not by the router.
+    "video_digest_local": [
+        {"provider": "local", "model": "deepseek-r1:14b"},
+    ],
+    # Tier name is historical: gpt-oss:120b-cloud used to fill this slot. Now
+    # local-only, so a second, different local model supplies the other draft.
+    "video_digest_cloud": [
+        {"provider": "local", "model": "qwen3:8b"},
     ],
 }
+
+# Provider names that predate the engine-neutral "local" provider. Still
+# accepted (in .env-supplied tiers, saved overrides, API payloads) and
+# rewritten to "local" so old configs keep working.
+LEGACY_LOCAL_PROVIDERS = frozenset({"ollama_local"})
+LOCAL_PROVIDER = "local"
+
+
+def normalize_capability_tiers(tiers: CapabilityTiers) -> CapabilityTiers:
+    """Return a copy of ``tiers`` with legacy local provider names rewritten
+    to the engine-neutral "local"."""
+    return {
+        tier: [
+            {**entry, "provider": LOCAL_PROVIDER}
+            if entry.get("provider") in LEGACY_LOCAL_PROVIDERS
+            else dict(entry)
+            for entry in chain
+        ]
+        for tier, chain in tiers.items()
+    }
+
+
+def _is_valid_tiers(data: Any) -> bool:
+    return isinstance(data, dict) and all(
+        isinstance(chain, list)
+        and all(
+            isinstance(e, dict) and isinstance(e.get("provider"), str) and isinstance(e.get("model"), str)
+            for e in chain
+        )
+        for chain in data.values()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -120,11 +193,27 @@ class Settings(BaseSettings):
     EMAIL_RECIPIENT: str = ""
 
     # ------------------------------------------------------------------
-    # Ollama
+    # Local LLM server
     # ------------------------------------------------------------------
+    # Two supported engines: llama.cpp behind llama-swap (default) and Ollama.
+    # Ollama is never the silent fallback — it is used only when
+    # LOCAL_LLM_ENGINE=ollama says so. LOCAL_LLM_BASE_URL, when set, overrides
+    # the engine's default address (keep LOCAL_LLM_ENGINE matching what it
+    # points at: dev_agent speaks a different wire format per engine).
+    LOCAL_LLM_ENGINE: Literal["llama", "ollama"] = "llama"
+    LOCAL_LLM_BASE_URL: str = ""
+    LLAMA_SWAP_BASE_URL: str = "http://localhost:8090"
     OLLAMA_LOCAL_BASE_URL: str = "http://localhost:11434"
     OLLAMA_CLOUD_BASE_URL: str = ""
     OLLAMA_CLOUD_API_KEY: str = ""
+
+    @property
+    def local_base_url(self) -> str:
+        if self.LOCAL_LLM_BASE_URL:
+            return self.LOCAL_LLM_BASE_URL
+        if self.LOCAL_LLM_ENGINE == "ollama":
+            return self.OLLAMA_LOCAL_BASE_URL
+        return self.LLAMA_SWAP_BASE_URL
 
     # ------------------------------------------------------------------
     # Application
@@ -144,6 +233,8 @@ class Settings(BaseSettings):
     SKILLS_DIR: Path = Path()   # populated by validator below
     UPLOADS_DIR: Path = Path()  # populated by validator below
     PROJECTS_YAML_PATH: Path = Path()  # populated by validator below
+    # Capability tiers saved from the settings page; see load_saved_capability_tiers().
+    CAPABILITY_TIERS_PATH: Path = Path()  # populated by validator below
 
     @model_validator(mode="after")
     def build_derived_paths(self) -> "Settings":
@@ -154,6 +245,8 @@ class Settings(BaseSettings):
             self.UPLOADS_DIR = self.BASE_DIR / "data" / "uploads"
         if self.PROJECTS_YAML_PATH == Path():
             self.PROJECTS_YAML_PATH = self.BASE_DIR / "projects.yaml"
+        if self.CAPABILITY_TIERS_PATH == Path():
+            self.CAPABILITY_TIERS_PATH = self.BASE_DIR / "data" / "capability_tiers.json"
         return self
 
     # ------------------------------------------------------------------
@@ -184,6 +277,39 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+def load_saved_capability_tiers() -> CapabilityTiers | None:
+    """Tiers saved from the settings page, or None when there is no usable
+    saved file (missing, unreadable, or malformed — logged, never raised, so a
+    bad file can't stop the app from starting on the built-in defaults)."""
+    path = settings.CAPABILITY_TIERS_PATH
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("Ignoring unreadable {}: {}", path, exc)
+        return None
+    if not _is_valid_tiers(data):
+        logger.error("Ignoring {}: expected {{tier: [{{provider, model}}, ...]}}", path)
+        return None
+    return normalize_capability_tiers(data)
+
+
+def save_capability_tiers(tiers: CapabilityTiers) -> None:
+    """Persist ``tiers`` so they survive a restart. Written to a temp file and
+    renamed so a crash mid-write can't leave a truncated file behind."""
+    path = settings.CAPABILITY_TIERS_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(tiers, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+settings.CAPABILITY_TIERS = load_saved_capability_tiers() or normalize_capability_tiers(
+    settings.CAPABILITY_TIERS
+)
+
+
 # ---------------------------------------------------------------------------
 # Tracked projects (daily cross-project check-in — see
 # DESIGN_每日跨專案進度確認機制.md)
@@ -202,6 +328,14 @@ class TrackedProject(BaseModel):
     auto_wake: bool = False
 
 
+def _yaml_dump(data: Any, path: Path) -> None:
+    import io
+
+    buf = io.StringIO()
+    _yaml.dump(data, buf)
+    path.write_text(buf.getvalue(), encoding="utf-8")
+
+
 def load_tracked_projects() -> list[TrackedProject]:
     """Read projects.yaml fresh on every call (cheap — a handful of entries)
     so the list can be edited without restarting the backend. Returns only
@@ -213,7 +347,7 @@ def load_tracked_projects() -> list[TrackedProject]:
         logger.warning("projects.yaml not found at {}; no projects tracked.", path)
         return []
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = _yaml.load(path.read_text(encoding="utf-8")) or {}
         projects = [TrackedProject(**entry) for entry in data.get("projects", [])]
     except Exception as exc:
         logger.error("Failed to parse {}: {}", path, exc)
@@ -230,7 +364,7 @@ def add_tracked_project(name: str, label: str, repo_path: str, auto_wake: bool =
     """
     path = settings.PROJECTS_YAML_PATH
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+        data = _yaml.load(path.read_text(encoding="utf-8")) if path.exists() else {}
     except Exception as exc:
         logger.error("Failed to parse {}: {}", path, exc)
         data = {}
@@ -241,7 +375,7 @@ def add_tracked_project(name: str, label: str, repo_path: str, auto_wake: bool =
     entries.append(
         {"name": name, "label": label, "repo_path": repo_path, "enabled": True, "auto_wake": auto_wake}
     )
-    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    _yaml_dump(data, path)
     return True
 
 
@@ -257,14 +391,20 @@ def remove_tracked_project(name: str) -> bool:
     if not path.exists():
         return False
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = _yaml.load(path.read_text(encoding="utf-8")) or {}
     except Exception as exc:
         logger.error("Failed to parse {}: {}", path, exc)
         return False
     entries = data.get("projects", [])
-    remaining = [e for e in entries if e.get("name") != name]
-    if len(remaining) == len(entries):
+    matching_indices = [i for i, e in enumerate(entries) if e.get("name") == name]
+    if not matching_indices:
         return False
-    data["projects"] = remaining
-    path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    # Delete matching entries by index, in reverse, directly on the existing
+    # CommentedSeq (rather than reassigning data["projects"] to a fresh
+    # plain list) — ruamel keeps standalone/sequence-level comments aligned
+    # with the remaining items' indices when you delete through its own
+    # __delitem__, but a wholesale replacement loses that bookkeeping.
+    for i in reversed(matching_indices):
+        del entries[i]
+    _yaml_dump(data, path)
     return True

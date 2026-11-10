@@ -7,11 +7,11 @@ const OCR_ENGINES: { value: string; label: string }[] = [
   { value: "vlm", label: "VLM（生成式，密集文字仍可能幻覺）" },
 ];
 
-const PROVIDERS = ["ollama_local", "ollama_cloud"];
+const PROVIDERS = ["local", "ollama_cloud"];
 
 export default function SettingsView() {
   const [tiers, setTiers] = useState<CapabilityTiers>({});
-  const [ollamaModels, setOllamaModels] = useState<OllamaModel[]>([]);
+  const [localModels, setLocalModels] = useState<OllamaModel[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
@@ -26,10 +26,10 @@ export default function SettingsView() {
   }
 
   useEffect(() => {
-    Promise.all([api.getCapabilityTiers(), api.getOllamaModels().catch(() => ({ models: [] }))]).then(
+    Promise.all([api.getCapabilityTiers(), api.getLocalModels().catch(() => ({ models: [] }))]).then(
       ([tiersRes, modelsRes]) => {
         setTiers(tiersRes.tiers);
-        setOllamaModels(modelsRes.models);
+        setLocalModels(modelsRes.models);
         setLoading(false);
       }
     );
@@ -57,7 +57,7 @@ export default function SettingsView() {
   }
 
   function addEntry(tier: string) {
-    setTiers((t) => ({ ...t, [tier]: [...t[tier], { provider: "ollama_local", model: "" }] }));
+    setTiers((t) => ({ ...t, [tier]: [...t[tier], { provider: "local", model: "" }] }));
   }
 
   function removeEntry(tier: string, idx: number) {
@@ -69,7 +69,7 @@ export default function SettingsView() {
     setSaveMsg(null);
     try {
       await api.updateCapabilityTiers(tiers);
-      setSaveMsg("已儲存（僅在記憶體中生效，重啟後會還原——要永久生效需同步更新 .env）");
+      setSaveMsg("已儲存（重啟後仍會保留）");
     } catch (e) {
       setSaveMsg("儲存失敗：" + (e as Error).message);
     } finally {
@@ -154,13 +154,13 @@ export default function SettingsView() {
                   ))}
                 </select>
                 <input
-                  list={`ollama-models-${tier}-${idx}`}
+                  list={`local-models-${tier}-${idx}`}
                   value={entry.model}
                   onChange={(e) => updateEntry(tier, idx, "model", e.target.value)}
                   style={{ flex: 1 }}
                 />
-                <datalist id={`ollama-models-${tier}-${idx}`}>
-                  {ollamaModels.map((m) => (
+                <datalist id={`local-models-${tier}-${idx}`}>
+                  {localModels.map((m) => (
                     <option key={m.name} value={m.name} />
                   ))}
                 </datalist>

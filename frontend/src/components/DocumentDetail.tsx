@@ -4,6 +4,79 @@ import { api } from "../api/client";
 import type { Document, DocumentContent } from "../api/types";
 import StatusPill from "./StatusPill";
 
+function parseTimestampSeconds(ts: string): number | null {
+  const m = /^(\d+):(\d{2})$/.exec(ts.trim());
+  if (!m) return null;
+  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+}
+
+const REVIEW_SOURCE_LABEL: Record<string, string> = {
+  "claude-judge": "Claude 評審（比對本地+雲端草稿後）",
+  "local-fallback": "本地模型草稿（評審不可用，取自評信心較高者）",
+  "cloud-fallback": "雲端模型草稿（評審不可用，取自評信心較高者）",
+  "local-only": "本地模型草稿（雲端草稿失敗）",
+  "cloud-only": "雲端模型草稿（本地草稿失敗）",
+};
+
+function renderVideoDigest(digest: Record<string, unknown>, sourceUrl: string | null) {
+  const sections = Array.isArray(digest.sections) ? digest.sections : [];
+  if (sections.length === 0) return null;
+
+  return (
+    <>
+      <h3 style={{ fontSize: 13, margin: "10px 0 4px" }}>📺 影片重點整理</h3>
+      {sections.map((section, i) => {
+        if (typeof section !== "object" || section === null) return null;
+        const heading = (section as Record<string, unknown>).heading;
+        const points = (section as Record<string, unknown>).points;
+        return (
+          <div key={i} style={{ marginBottom: 8 }}>
+            {typeof heading === "string" && (
+              <div style={{ fontSize: 13, fontWeight: 600, margin: "6px 0 2px" }}>{heading}</div>
+            )}
+            <ul style={{ margin: "0 0 0 18px", padding: 0, fontSize: 13, lineHeight: 1.6 }}>
+              {Array.isArray(points) &&
+                points.map((point, j) => {
+                  if (typeof point !== "object" || point === null) return null;
+                  const text = (point as Record<string, unknown>).text;
+                  const rawTimestamp = (point as Record<string, unknown>).timestamp;
+                  const timestamp = typeof rawTimestamp === "string" ? rawTimestamp : null;
+                  const seconds = timestamp !== null ? parseTimestampSeconds(timestamp) : null;
+                  return (
+                    <li key={j}>
+                      {typeof text === "string" ? text : ""}
+                      {seconds !== null && timestamp !== null && sourceUrl && (
+                        <a
+                          href={`${sourceUrl}${sourceUrl.includes("?") ? "&" : "?"}t=${seconds}s`}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{ marginLeft: 6, fontSize: 11 }}
+                        >
+                          [{timestamp}]
+                        </a>
+                      )}
+                    </li>
+                  );
+                })}
+            </ul>
+          </div>
+        );
+      })}
+      {typeof digest.conclusion === "string" && digest.conclusion && (
+        <p style={{ fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{digest.conclusion}</p>
+      )}
+      {typeof digest.confidence_score === "number" && (
+        <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+          🧪 信心分數：{digest.confidence_score}/100
+          {typeof digest.review_source === "string" && (
+            <> （{REVIEW_SOURCE_LABEL[digest.review_source] ?? digest.review_source}）</>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
 export default function DocumentDetail({
   doc,
   onClose,
@@ -45,6 +118,12 @@ export default function DocumentDetail({
       setRetrying(false);
     }
   }
+
+  const videoDigestRaw = content?.type_specific_data?.["video_digest"];
+  const videoDigest =
+    videoDigestRaw && typeof videoDigestRaw === "object"
+      ? (videoDigestRaw as Record<string, unknown>)
+      : null;
 
   async function handleSaveNote() {
     setSavingNote(true);
@@ -93,6 +172,8 @@ export default function DocumentDetail({
             <p style={{ fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{doc.ai_insight}</p>
           </>
         )}
+
+        {videoDigest && renderVideoDigest(videoDigest, doc.source_url)}
 
         <div style={{ margin: "8px 0" }}>
           {doc.tags.map((t) => (

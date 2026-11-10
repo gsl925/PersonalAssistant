@@ -33,6 +33,7 @@ _CORRECTION_PROMPT_TEMPLATE = (
     "（尤其是專有名詞、技術術語）。請只修正明顯是辨識錯誤的地方，"
     "不要改寫句子結構、不要精簡、不要摘要、不要新增或刪除內容、"
     "不要調整任何數字、日期、人名，除非該處明顯是同音字誤植。"
+    "每行開頭的時間標記（例如 [03:30]）請原封不動保留，不要修改、不要移除。"
     "如果不確定某處是否有錯，保持原樣不要動。"
     "直接輸出修正後的逐字稿，不要加任何說明、不要用 markdown 標記。\n\n"
     "逐字稿片段：\n{chunk}"
@@ -42,7 +43,26 @@ _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 def _chunk(text: str, size: int) -> list[str]:
-    return [text[i : i + size] for i in range(0, len(text), size)]
+    """Accumulate lines up to ~size chars per chunk, never splitting a line
+    in half — needed since a timestamped transcript's ``[MM:SS]`` marker and
+    its text must stay on one line for the correction prompt to honor the
+    "keep timestamps intact" instruction. Falls back to the plain-paragraph
+    case fine too: a transcript with no newlines is just one giant "line"
+    and comes out as a single chunk, same as the old char-slicing behavior
+    would for anything under `size`."""
+    lines = text.split("\n")
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        if current and current_len + len(line) + 1 > size:
+            chunks.append("\n".join(current))
+            current, current_len = [], 0
+        current.append(line)
+        current_len += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
 
 
 async def correct_transcript(model_router, text: str) -> str | None:

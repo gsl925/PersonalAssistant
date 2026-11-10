@@ -55,6 +55,36 @@ export interface SaveInsightResponse {
   ai_insight: string | null;
 }
 
+export interface AskChatResponse {
+  status: string;
+  doc_id: string | null;
+  message: string | null;
+  title: string | null;
+  summary: string | null;
+  category: string | null;
+  tags: string[] | null;
+}
+
+export interface KBSource {
+  doc_id: string;
+  title: string | null;
+  score: number;
+  created_at: string | null;
+}
+
+export interface KBAnswer {
+  answer: string | null;
+  model: string | null;
+  latency_ms: number | null;
+  error: string | null;
+}
+
+export interface AskKnowledgeBaseResponse {
+  sources: KBSource[];
+  local: KBAnswer;
+  cloud: KBAnswer | null;
+}
+
 export interface DocumentContent {
   id: string;
   title: string | null;

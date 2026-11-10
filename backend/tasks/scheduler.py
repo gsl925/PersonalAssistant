@@ -31,7 +31,7 @@ def setup_jobs(scheduler: AsyncIOScheduler) -> None:
     Called once during FastAPI lifespan startup, before scheduler.start().
     """
     from backend.tasks.processing import send_daily_digest
-    from backend.tasks.project_sync import sync_all_projects
+    from backend.tasks.project_sync import send_weekly_discuss_roundup, sync_all_projects
 
     # Daily digest at 08:00 Asia/Taipei
     scheduler.add_job(
@@ -56,6 +56,19 @@ def setup_jobs(scheduler: AsyncIOScheduler) -> None:
         misfire_grace_time=300,
     )
     logger.info("Scheduled: cross-project PROGRESS.md sync every 30 minutes")
+
+    # Weekly roundup of still-open "💬" items across all projects, Monday
+    # 09:00 Asia/Taipei — the oldest open decisions can otherwise sit
+    # unnoticed in Telegram scroll for weeks between individual relays.
+    scheduler.add_job(
+        send_weekly_discuss_roundup,
+        trigger=CronTrigger(day_of_week="mon", hour=9, minute=0, timezone="Asia/Taipei"),
+        id="weekly_discuss_roundup",
+        name="Weekly cross-project 💬 roundup",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    logger.info("Scheduled: weekly 💬 roundup on Monday 09:00 Asia/Taipei")
 
 
 def schedule_todo_reminder(scheduler: AsyncIOScheduler, reminder_id: str, remind_at: datetime) -> None:

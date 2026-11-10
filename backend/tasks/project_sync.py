@@ -25,7 +25,7 @@ import asyncio
 import json
 import re
 import shutil
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -66,6 +66,31 @@ _UPDATED_AT_PATTERN = re.compile(r"- 更新時間:[ \t]*(.*)")
 # "#N 需要你決定" tag on each relayed message) — e.g. "1. 好，加進去" or "1 好".
 _REPLY_NUMBER_PATTERN = re.compile(r"^\s*#?(\d+)[.:、\s]+(.*)$", re.DOTALL)
 
+# Canned quick-reply choices for a relayed "💬" item — covers the common
+# cases so most decisions need a tap instead of typing a reply (which also
+# sidesteps the multi-hashtag/number-typo mis-routing risk entirely). Typing
+# a free-text reply still works exactly as before for anything these don't
+# cover.
+_DISCUSS_QUICK_REPLIES: dict[str, str] = {
+    "ok": "好，照做",
+    "no": "不要",
+    "defer": "先緩著，之後再討論",
+}
+
+
+def _discuss_item_keyboard(project_name: str, number: int) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": f"👍 {_DISCUSS_QUICK_REPLIES['ok']}", "callback_data": f"discuss:{project_name}#{number}:ok"},
+                {"text": f"👎 {_DISCUSS_QUICK_REPLIES['no']}", "callback_data": f"discuss:{project_name}#{number}:no"},
+            ],
+            [
+                {"text": f"🤔 {_DISCUSS_QUICK_REPLIES['defer']}", "callback_data": f"discuss:{project_name}#{number}:defer"},
+            ],
+        ]
+    }
+
 
 def _progress_path(project: TrackedProject) -> Path:
     return Path(project.repo_path) / PROGRESS_FILENAME
@@ -86,7 +111,7 @@ def _append_history(project: TrackedProject, discuss_content: str, decision_text
             f.write(entry)
 
 
-async def _send_relay(text: str) -> None:
+async def _send_relay(text: str, reply_markup: dict | None = None) -> None:
     """Send to the user's private/replyable chat with the bot (needed here
     since "💬 待溝通/建議" and "📋 進度回報" both expect a reply back), not the
     broadcast-only TELEGRAM_CHAT_ID digest channel that _send_telegram()
@@ -105,9 +130,9 @@ async def _send_relay(text: str) -> None:
     try:
         from backend.main import get_telegram_bot
 
-        await get_telegram_bot().send_message(text, parse_mode=None)
+        await get_telegram_bot().send_message(text, parse_mode=None, reply_markup=reply_markup)
     except RuntimeError:
-        await _send_telegram(text, parse_mode=None)
+        await _send_telegram(text, parse_mode=None, reply_markup=reply_markup)
 
 
 def _split_sections(text: str) -> dict[str, str]:
@@ -202,13 +227,27 @@ async def _relay_discuss_items(project: TrackedProject, full_text: str, pstate: 
     already-relayed, still-unresolved item quietly stays `[ ]` without being
     re-sent to Telegram every cycle."""
     sections = _split_sections(full_text)
+    discuss_bullets = _extract_bullets(sections[_DISCUSS_HEADER])
+    # Drop tracking for items whose bullet got checked or edited/removed
+    # directly in the file without going through write_instruction — left
+    # unreconciled, these "ghost" items never disappear from
+    # awaiting_decision, which both keeps stale #N references alive and
+    # inflates the "exactly one open item" count write_instruction() uses
+    # to auto-resolve an unnumbered reply.
+    still_open_content = {b["content"] for b in discuss_bullets if not b["checked"]}
+    pstate["awaiting_decision"][:] = [
+        item for item in pstate["awaiting_decision"] if item["content"] in still_open_content
+    ]
     already_tracked = {item["content"] for item in pstate["awaiting_decision"]}
-    for bullet in _extract_bullets(sections[_DISCUSS_HEADER]):
+    for bullet in discuss_bullets:
         if bullet["checked"] or bullet["content"] in already_tracked:
             continue
         number = pstate["next_item_number"]
         try:
-            await _send_relay(f"💬 [{project.label}] #{number} 需要你決定：{bullet['content']}\n\n#{project.name}")
+            await _send_relay(
+                f"💬 [{project.label}] #{number} 需要你決定：{bullet['content']}\n\n#{project.name}",
+                reply_markup=_discuss_item_keyboard(project.name, number),
+            )
         except Exception as exc:
             # Don't burn this item's number or mark it tracked — leave it
             # for a retry next cycle — and don't let one bad bullet stop the
@@ -290,20 +329,24 @@ async def _maybe_wake_project(project: TrackedProject, full_text: str, pstate: d
     task (not awaited here) so a slow/failed wake never blocks this cycle's
     sync for the other tracked projects.
     """
-    if not project.auto_wake:
-        return
-
     sections = _split_sections(full_text)
     open_bullets = [b for b in _extract_bullets(sections[_INSTRUCT_HEADER]) if not b["checked"]]
 
     tracked = pstate["pending_instructions"]
     still_open_content = {b["content"] for b in open_bullets}
-    # Drop tracking for items that got checked off or removed since last cycle.
+    # Drop tracking for items that got checked off or removed since last
+    # cycle. Done unconditionally (before the auto_wake gate below) so this
+    # state stays reconciled/bounded even for projects with auto_wake off —
+    # otherwise it never gets cleaned up while off and only starts catching
+    # up (confusingly) once/if auto_wake is later turned on.
     tracked[:] = [t for t in tracked if t["content"] in still_open_content]
     already_tracked_content = {t["content"] for t in tracked}
     for bullet in open_bullets:
         if bullet["content"] not in already_tracked_content:
             tracked.append({"content": bullet["content"], "first_seen_cycle": pstate["cycle"]})
+
+    if not project.auto_wake:
+        return
 
     if not tracked:
         return
@@ -450,6 +493,19 @@ async def write_instruction(project_name: str, text: str) -> bool:
     new_line = f"- [ ] {today} {instruction_text}"
     full_text = full_text.rstrip("\n") + "\n" + new_line + "\n"
 
+    if target_item is not None and target_item["raw_line"] not in full_text:
+        # The bullet's exact text no longer appears (edited or removed in
+        # the file since it was relayed) — .replace() below would silently
+        # no-op, yet the old code still removed it from awaiting_decision
+        # and archived it as resolved, permanently desyncing PA's bookkeeping
+        # from the file (box never actually checked, item never relayed
+        # again). Treat it as unresolved instead and leave it tracked.
+        logger.warning(
+            "write_instruction: #{} raw_line for {} no longer matches current file; "
+            "leaving unresolved.", target_item["number"], project_name,
+        )
+        target_item = None
+
     if target_item is not None:
         checked_line = target_item["raw_line"].replace("- [ ]", "- [x]", 1)
         full_text = full_text.replace(target_item["raw_line"], checked_line, 1)
@@ -585,3 +641,54 @@ async def sync_all_projects() -> None:
             logger.error("Project sync failed for {}: {}", project.name, exc)
 
     _write_state(state)
+
+
+_LEADING_DATE_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+def _item_age_days(content: str) -> int | None:
+    """Items are written as "YYYY-MM-DD 一句話描述" (see SDD_PROGRESS_SYNC.md),
+    so the leading date is a more reliable age signal than the 30-min sync
+    cycle counter — the latter undercounts whenever the backend wasn't
+    continuously running."""
+    match = _LEADING_DATE_PATTERN.match(content.strip())
+    if not match:
+        return None
+    try:
+        item_date = date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+    return (datetime.now(_TAIPEI).date() - item_date).days
+
+
+async def send_weekly_discuss_roundup() -> None:
+    """Once a week, relay every still-open "💬" item across all tracked
+    projects in one consolidated message — the 💬 items are each relayed
+    individually once (see _relay_discuss_items), but a reply-less item
+    otherwise has no further visibility beyond Telegram scroll until it
+    happens to get escalated into a Dashboard todo. Always sends something,
+    even "沒有待決項目", for the same reason the daily digest's no-docs case
+    does — silence here is otherwise indistinguishable from "this job
+    stopped running."""
+    state = _read_state()
+    lines = ["📋 本週待決事項彙總："]
+    any_open = False
+    for project in load_tracked_projects():
+        pstate = state.get(project.name)
+        if not pstate:
+            continue
+        items = pstate.get("awaiting_decision", [])
+        if not items:
+            continue
+        any_open = True
+        lines.append(f"\n[{project.label}]")
+        for item in sorted(items, key=lambda i: i["number"]):
+            age = _item_age_days(item["content"])
+            age_suffix = f"（已開 {age} 天）" if age is not None else ""
+            content_preview = item["content"][:150]
+            lines.append(f"- #{item['number']}{age_suffix}：{content_preview}")
+
+    if not any_open:
+        lines.append("\n目前沒有待決事項。")
+
+    await _send_relay("\n".join(lines))

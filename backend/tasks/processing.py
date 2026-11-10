@@ -109,6 +109,48 @@ async def process_content_async(
 # Daily digest
 # ---------------------------------------------------------------------------
 
+_TODO_SECTION_MAX_ITEMS = 10
+
+# Rotates through one tip per day — features that exist but are easy to
+# forget about since their only mention is a one-time /start message (per
+# user's 2026-10-02 "忘了有這個功能"/"忘了可以這樣用" diagnosis). The daily
+# digest is checked far more often than /start, so it's a better place for
+# an ongoing reminder than a one-shot message nobody re-reads.
+_FEATURE_TIPS = [
+    "💡 小提示：想先看一篇文章「作者到底想表達什麼」再決定要不要收藏，用 /insight <網址>。",
+    "💡 小提示：傳截圖/照片給我可以自動分析螢幕截圖內容，傳語音/錄音可以自動轉錄會議重點。",
+    "💡 小提示：想找回之前問過的問題，dashboard 的「問答記錄」頁可以查看所有 /ask 歷史。",
+]
+
+
+def _pick_feature_tip(today: date) -> str:
+    return _FEATURE_TIPS[today.toordinal() % len(_FEATURE_TIPS)]
+
+
+async def _build_todo_reminder_section(session, today: date) -> str | None:
+    """Pending todos with no due_date, or overdue, don't otherwise surface
+    anywhere except a direct /todo list query — folding them into the daily
+    digest means they don't just silently age out of sight. Returns None
+    when there's nothing to show."""
+    from backend.knowledge import crud
+
+    pending = await crud.list_todos(session, status="pending")
+    overdue = sorted(
+        (t for t in pending if t.due_date is not None and t.due_date < today),
+        key=lambda t: t.due_date,
+    )
+    no_due = [t for t in pending if t.due_date is None]
+    if not overdue and not no_due:
+        return None
+
+    lines = ["⚠️ 待辦提醒："]
+    for t in overdue[:_TODO_SECTION_MAX_ITEMS]:
+        lines.append(f"- 逾期（{t.due_date.isoformat()}）：{t.content}")
+    for t in no_due[:_TODO_SECTION_MAX_ITEMS]:
+        lines.append(f"- 沒有日期：{t.content}")
+    return "\n".join(lines)
+
+
 async def send_daily_digest(orchestrator=None, *, force: bool = False) -> int | None:
     """Generate and deliver the daily digest of today's processed documents.
 
@@ -138,12 +180,19 @@ async def send_daily_digest(orchestrator=None, *, force: bool = False) -> int | 
 
     async with async_session_maker() as session:
         docs = await get_documents_created_today(session)
+        todo_section = await _build_todo_reminder_section(session, today)
 
     if not docs:
         logger.info("Daily digest: no documents found for today.")
         # Still send a short heads-up (Telegram only, no email) — silence is
-        # indistinguishable from "the system is broken" otherwise.
-        await _send_telegram(f"*Daily Digest — {today.isoformat()}*\n\n今天沒有新內容。")
+        # indistinguishable from "the system is broken" otherwise. Overdue/
+        # no-due-date todos surface here too — they'd otherwise never show
+        # up anywhere except a direct /todo list query.
+        body = "今天沒有新內容。" + (f"\n\n{todo_section}" if todo_section else "") + f"\n\n{_pick_feature_tip(today)}"
+        sent = await _send_telegram(f"Daily Digest — {today.isoformat()}\n\n{body}", parse_mode=None)
+        if not sent:
+            logger.warning("Daily digest (no-docs) Telegram send failed; not marking today as done.")
+            return 0
         _write_last_digest_date(today)
         return 0
 
@@ -172,11 +221,21 @@ async def send_daily_digest(orchestrator=None, *, force: bool = False) -> int | 
         logger.error("Daily digest LLM failed: {}", exc)
         digest_text = f"[Daily digest generation failed: {exc}]\n\n" + "\n".join(doc_lines)
 
-    await _send_telegram(f"*Daily Digest — {today_str}*\n\n{digest_text}")
+    if todo_section:
+        digest_text = f"{digest_text}\n\n{todo_section}"
+    digest_text = f"{digest_text}\n\n{_pick_feature_tip(today)}"
+
+    # digest_text is LLM-generated prose, not hand-written — unbalanced
+    # `_`/`*`/backticks in it would make Telegram reject the whole message
+    # under Markdown parse_mode, so send it as plain text.
+    sent = await _send_telegram(f"Daily Digest — {today_str}\n\n{digest_text}", parse_mode=None)
     await _send_email(
         subject=f"Personal AI Assistant — Daily Digest {today_str}",
         body=digest_text,
     )
+    if not sent:
+        logger.warning("Daily digest Telegram send failed; not marking today as done.")
+        return len(docs)
     _write_last_digest_date(today)
     logger.info("Daily digest sent ({} docs).", len(docs))
     return len(docs)
@@ -223,11 +282,17 @@ async def send_todo_reminder(reminder_id: str) -> None:
                 {"text": "😴 明天再提醒", "callback_data": f"remind:{reminder_id}:snooze"},
             ]]
         }
-        await _send_telegram(
+        sent = await _send_telegram(
             f"{label}：{todo.content}{due_suffix}{url_suffix}",
             chat_id=todo_chat_id,
             reply_markup=keyboard,
         )
+        if not sent:
+            logger.warning(
+                "Todo reminder {} Telegram send failed; leaving unsent for restart catch-up.",
+                reminder_id,
+            )
+            return
 
         await crud.mark_todo_reminder_sent(db, reminder_uuid)
         await db.commit()
@@ -280,7 +345,7 @@ async def _send_telegram(
     chat_id: str | None = None,
     reply_markup: dict | None = None,
     parse_mode: str | None = "Markdown",
-) -> None:
+) -> bool:
     """Push *text* to *chat_id*, defaulting to TELEGRAM_CHAT_ID (the daily
     digest's destination) when not given explicitly.
 
@@ -293,13 +358,18 @@ async def _send_telegram(
     *parse_mode* defaults to Markdown for callers with controlled, hand-
     written text (e.g. the daily digest). Pass ``None`` when *text* embeds
     arbitrary/untrusted content (e.g. another project's raw PROGRESS.md
-    text) — unbalanced `_`/`*`/backticks in that content would otherwise
-    make Telegram reject the whole message as an entity-parse error.
+    text, or LLM-generated digest prose) — unbalanced `_`/`*`/backticks in
+    that content would otherwise make Telegram reject the whole message as
+    an entity-parse error.
+
+    Returns True only if the message was actually delivered — callers must
+    check this before recording the notification as sent, otherwise a
+    network/API failure gets silently treated as a success and never retried.
     """
     target = chat_id or settings.TELEGRAM_CHAT_ID
     if not settings.TELEGRAM_BOT_TOKEN or not target:
         logger.warning("Telegram not configured; skipping notification.")
-        return
+        return False
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": target,
@@ -315,6 +385,8 @@ async def _send_telegram(
             resp.raise_for_status()
         except httpx.HTTPError as exc:
             logger.error("Telegram send failed: {} | text preview: {!r}", exc, text[:200])
+            return False
+    return True
 
 
 async def _send_email(subject: str, body: str) -> None:

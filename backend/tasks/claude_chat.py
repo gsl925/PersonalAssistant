@@ -28,12 +28,24 @@ async def ask_claude(question: str, timeout: float = _TIMEOUT_SECONDS) -> dict:
     ``{"ok": False, "error": str}`` on failure/timeout — the caller decides
     how to surface that (Telegram reply, failed Document row, etc.).
     """
+    return await _run_claude_p(question, allowed_tools=_ALLOWED_TOOLS, timeout=timeout)
+
+
+async def ask_claude_with_context(prompt: str, timeout: float = _TIMEOUT_SECONDS) -> dict:
+    """Like :func:`ask_claude`, but for RAG prompts that already embed the
+    knowledge-base context — no WebSearch/WebFetch here, since letting Claude
+    go fetch outside sources would defeat the point of grounding the answer
+    only in the user's own stored content."""
+    return await _run_claude_p(prompt, allowed_tools="", timeout=timeout)
+
+
+async def _run_claude_p(prompt: str, allowed_tools: str, timeout: float) -> dict:
+    args = ["claude", "-p", prompt, "--output-format", "text", "--no-session-persistence"]
+    if allowed_tools:
+        args += ["--tools", allowed_tools, "--allowedTools", allowed_tools]
+
     proc = await asyncio.create_subprocess_exec(
-        "claude", "-p", question,
-        "--tools", _ALLOWED_TOOLS,
-        "--allowedTools", _ALLOWED_TOOLS,
-        "--output-format", "text",
-        "--no-session-persistence",
+        *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -42,7 +54,7 @@ async def ask_claude(question: str, timeout: float = _TIMEOUT_SECONDS) -> dict:
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        logger.error("claude -p timed out after {}s for question: {:.60}", timeout, question)
+        logger.error("claude -p timed out after {}s for prompt: {:.60}", timeout, prompt)
         return {"ok": False, "error": "回答逾時，請稍後再試。"}
 
     if proc.returncode != 0:

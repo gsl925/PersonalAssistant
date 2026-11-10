@@ -3,7 +3,7 @@ projects:
   label: GenAI News
   repo_path: D:/_SideProject/Topic_News/genai
   enabled: true
-  auto_wake: false
+  auto_wake: false  # verified working 2026-07-30 — turn back on if needed, see claude_wake.py
 - name: personal-assistant
   label: Personal Assistant
   repo_path: D:/_SideProject/PersonalContent_Assistant

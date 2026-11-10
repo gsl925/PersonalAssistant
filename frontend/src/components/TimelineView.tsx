@@ -53,7 +53,7 @@ export default function TimelineView() {
           value={filters.project_id ?? ""}
           onChange={(e) => setFilters((f) => ({ ...f, project_id: e.target.value || undefined }))}
         >
-          <option value="">全部專案</option>
+          <option value="">全部主題</option>
           {projects.map((p) => (
             <option key={p.id} value={p.id}>
               {p.name}

@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 from loguru import logger
 
-from backend.config import settings
+from backend.config import LEGACY_LOCAL_PROVIDERS, LOCAL_PROVIDER, settings
 
 
 # ---------------------------------------------------------------------------
@@ -24,8 +24,21 @@ class QuotaExceededError(Exception):
     """HTTP 429 or explicit quota-exceeded signal from a provider."""
 
 
-class OllamaResourceError(Exception):
-    """Connection error, timeout, or out-of-resources response from Ollama."""
+class LocalLLMError(Exception):
+    """Connection error, timeout, or out-of-resources response from a provider."""
+
+
+def resolve_provider(provider: str) -> tuple[str, str]:
+    """Return (base_url, api_key) for a given provider name.
+
+    Raises ValueError for an unknown provider. "ollama_local" is accepted as
+    the old name of "local".
+    """
+    if provider == LOCAL_PROVIDER or provider in LEGACY_LOCAL_PROVIDERS:
+        return settings.local_base_url, ""
+    if provider == "ollama_cloud":
+        return settings.OLLAMA_CLOUD_BASE_URL, settings.OLLAMA_CLOUD_API_KEY
+    raise ValueError(f"Unknown provider: {provider!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +72,8 @@ class ModelRouter:
         **kwargs,
     ) -> str:
         """Run a text-only chat completion through the given capability tier."""
-        return await self._run_chain(tier, messages, image_base64=None, **kwargs)
+        content, _model = await self._run_chain(tier, messages, image_base64=None, **kwargs)
+        return content
 
     async def chat_with_image(
         self,
@@ -69,7 +83,19 @@ class ModelRouter:
         **kwargs,
     ) -> str:
         """Run a vision chat completion (image + text)."""
-        return await self._run_chain(tier, messages, image_base64=image_base64, **kwargs)
+        content, _model = await self._run_chain(tier, messages, image_base64=image_base64, **kwargs)
+        return content
+
+    async def chat_with_meta(
+        self,
+        tier: str,
+        messages: list[dict],
+        **kwargs,
+    ) -> tuple[str, str]:
+        """Like :meth:`chat`, but also returns which model in the fallback
+        chain actually answered — needed by the knowledge-base RAG endpoint
+        to label which local model produced a given answer."""
+        return await self._run_chain(tier, messages, image_base64=None, **kwargs)
 
     async def get_embedding(self, text: str) -> list[float]:
         """Return an embedding vector for *text* using the embedding tier."""
@@ -81,14 +107,14 @@ class ModelRouter:
                 logger.debug("Skipping {}/{} (cooldown)", provider, model)
                 continue
 
-            base_url, api_key = self._resolve_provider(provider)
+            base_url, api_key = resolve_provider(provider)
             try:
                 vector = await self._make_embedding_call(base_url, api_key, model, text)
                 return vector
             except QuotaExceededError:
                 self._set_cooldown(provider, model, hours=1)
                 logger.warning("Quota exceeded for {}/{}, setting 1h cooldown", provider, model)
-            except OllamaResourceError as exc:
+            except LocalLLMError as exc:
                 logger.warning("Resource error for {}/{}: {}", provider, model, exc)
 
         raise AllProvidersFailedError("All providers failed for embedding request.")
@@ -103,7 +129,7 @@ class ModelRouter:
         messages: list[dict],
         image_base64: str | None,
         **kwargs,
-    ) -> str:
+    ) -> tuple[str, str]:
         chain = self._tiers.get(tier)
         if not chain:
             raise AllProvidersFailedError(f"Unknown capability tier: {tier!r}")
@@ -116,34 +142,26 @@ class ModelRouter:
                 logger.debug("Skipping {}/{} (cooldown)", provider, model)
                 continue
 
-            base_url, api_key = self._resolve_provider(provider)
+            base_url, api_key = resolve_provider(provider)
             try:
                 response = await self._make_chat_call(
                     base_url, api_key, model, messages, image_base64, **kwargs
                 )
-                return response
+                return response, model
             except QuotaExceededError:
                 self._set_cooldown(provider, model, hours=1)
                 logger.warning(
                     "Quota exceeded for {}/{}, setting 1h cooldown", provider, model
                 )
-            except OllamaResourceError as exc:
+            except LocalLLMError as exc:
                 logger.warning(
                     "Resource/timeout error for {}/{}: {}", provider, model, exc
                 )
 
         raise AllProvidersFailedError(
             f"All providers failed for tier={tier!r}. "
-            "Check Ollama is running and cloud quota is available."
+            "Check the local LLM server is running and cloud quota is available."
         )
-
-    def _resolve_provider(self, provider: str) -> tuple[str, str]:
-        """Return (base_url, api_key) for a given provider name."""
-        if provider == "ollama_local":
-            return settings.OLLAMA_LOCAL_BASE_URL, ""
-        if provider == "ollama_cloud":
-            return settings.OLLAMA_CLOUD_BASE_URL, settings.OLLAMA_CLOUD_API_KEY
-        raise ValueError(f"Unknown provider: {provider!r}")
 
     def _is_in_cooldown(self, provider: str, model: str) -> bool:
         key = (provider, model)
@@ -170,7 +188,7 @@ class ModelRouter:
     ) -> str:
         """POST to /v1/chat/completions and return the assistant message content."""
         if not base_url:
-            raise OllamaResourceError("Provider base URL is not configured.")
+            raise LocalLLMError("Provider base URL is not configured.")
 
         # Inject image into the last user message when provided
         if image_base64:
@@ -201,14 +219,14 @@ class ModelRouter:
             try:
                 resp = await client.post(url, json=payload, headers=headers)
             except (httpx.ConnectError, httpx.TimeoutException) as exc:
-                raise OllamaResourceError(str(exc)) from exc
+                raise LocalLLMError(str(exc)) from exc
 
         if resp.status_code == 429:
             raise QuotaExceededError(f"HTTP 429 from {url}")
         if resp.status_code >= 500:
-            raise OllamaResourceError(f"HTTP {resp.status_code} from {url}: {resp.text[:200]}")
+            raise LocalLLMError(f"HTTP {resp.status_code} from {url}: {resp.text[:200]}")
         if resp.status_code >= 400:
-            raise OllamaResourceError(f"HTTP {resp.status_code} from {url}: {resp.text[:200]}")
+            raise LocalLLMError(f"HTTP {resp.status_code} from {url}: {resp.text[:200]}")
 
         data = resp.json()
         return data["choices"][0]["message"]["content"]
@@ -221,7 +239,7 @@ class ModelRouter:
         text: str,
     ) -> list[float]:
         if not base_url:
-            raise OllamaResourceError("Provider base URL is not configured.")
+            raise LocalLLMError("Provider base URL is not configured.")
 
         payload = {"model": model, "input": text}
         headers = {"Content-Type": "application/json"}
@@ -233,12 +251,12 @@ class ModelRouter:
             try:
                 resp = await client.post(url, json=payload, headers=headers)
             except (httpx.ConnectError, httpx.TimeoutException) as exc:
-                raise OllamaResourceError(str(exc)) from exc
+                raise LocalLLMError(str(exc)) from exc
 
         if resp.status_code == 429:
             raise QuotaExceededError(f"HTTP 429 from {url}")
         if resp.status_code >= 400:
-            raise OllamaResourceError(f"HTTP {resp.status_code} from {url}")
+            raise LocalLLMError(f"HTTP {resp.status_code} from {url}")
 
         data = resp.json()
         return data["data"][0]["embedding"]

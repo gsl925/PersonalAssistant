@@ -1,7 +1,7 @@
 """Local dev-agent execution loop for factory-tools.
 
 Unlike claude_wake.py (Claude Code, cloud) or claude_chat.py, this drafts and
-writes the actual code change using a LOCAL Ollama model — deliberately no
+writes the actual code change using a LOCAL model — deliberately no
 cloud call for this stage, since factory source code/business data (SNs, CPU
 model codes, folder structures, ...) shouldn't leave the machine just to
 draft a script. Claude Code only enters afterward, as a review-only gate
@@ -13,19 +13,19 @@ Full autonomy, same trust boundary as claude_wake.py: the loop reads/writes
 files and runs shell commands inside factory-tools with no confirmation gate.
 
 Model is per-task (see run_dev_agent_task's local_model param), defaulting
-to _DEFAULT_OLLAMA_MODEL, so the user can A/B different local models for
-performance. Key implementation fact that still applies to any model chosen
-(verified live for qwen3-coder:30b before writing this): tool calls only
-come back as a structured `tool_calls` field via Ollama's NATIVE `/api/chat`
-endpoint — the OpenAI-compatible `/v1/chat/completions` endpoint (what
-ModelRouter uses) dumped a malformed pseudo-XML tag into `content` instead
-for that model. This module talks to `/api/chat` directly rather than going
-through ModelRouter — but a different model swapped in here isn't guaranteed
-to support native tool-calling equally well; that's part of what the A/B is for.
+to _DEFAULT_LOCAL_MODEL, so the user can A/B different local models for
+performance. Speaks whichever wire format settings.LOCAL_LLM_ENGINE names:
+OpenAI-compatible `/v1/chat/completions` for llama-swap (llama-server needs
+--jinja for structured `tool_calls`), Ollama's native `/api/chat` for Ollama —
+because Ollama's /v1 endpoint dumped a malformed pseudo-XML tag into `content`
+for qwen3-coder:30b instead of `tool_calls`. Goes directly rather than through
+ModelRouter, which has no tool support — and a different model swapped in here
+isn't guaranteed to support tool calling equally well; that's part of what the
+A/B is for.
 
-Whether a multi-turn tool loop reliably terminates on this Ollama version is
-NOT proven yet (one quick follow-up-turn test hung) — every per-call and
-per-task limit below exists because of that, not just as generic caution.
+Whether a multi-turn tool loop reliably terminates is NOT proven yet (one
+quick follow-up-turn test hung on Ollama) — every per-call and per-task limit
+below exists because of that, not just as generic caution.
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ from backend.config import settings
 from backend.knowledge import crud
 from backend.knowledge.db import async_session_maker
 
-_DEFAULT_OLLAMA_MODEL = "qwen3-coder:30b"
+_DEFAULT_LOCAL_MODEL = "qwen3-coder:30b"
 _MAX_STEPS = 30
 # Generous on purpose: a cold model swap on this machine (evicting whatever
 # else is currently loaded, e.g. qwen2.5-coder:32b, then loading
@@ -283,19 +283,46 @@ class _Sandbox:
             return f"ERROR: {exc}"
 
 
-async def _call_ollama_chat(messages: list[dict], model_name: str) -> dict:
-    url = settings.OLLAMA_LOCAL_BASE_URL.rstrip("/") + "/api/chat"
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "tools": _TOOLS_SCHEMA,
-        "stream": False,
-        "options": {"temperature": _DRAFT_TEMPERATURE},
-    }
+async def _call_local_chat(messages: list[dict], model_name: str) -> dict:
+    """One tool-calling chat turn against the local LLM server; returns the
+    assistant message ({"role", "content", "tool_calls"?}). The wire format
+    follows settings.LOCAL_LLM_ENGINE: Ollama's /v1 mangles qwen3-coder's tool
+    calls, so Ollama goes through its native /api/chat; llama-server (--jinja)
+    gets them right on the OpenAI-compatible endpoint."""
+    base = settings.local_base_url.rstrip("/")
     async with httpx.AsyncClient(timeout=_PER_CALL_TIMEOUT) as client:
-        resp = await client.post(url, json=payload)
-    resp.raise_for_status()
-    return resp.json()
+        if settings.LOCAL_LLM_ENGINE == "ollama":
+            resp = await client.post(
+                base + "/api/chat",
+                json={
+                    "model": model_name,
+                    "messages": messages,
+                    "tools": _TOOLS_SCHEMA,
+                    "stream": False,
+                    "options": {"temperature": _DRAFT_TEMPERATURE},
+                },
+            )
+            resp.raise_for_status()
+            message = resp.json().get("message", {})
+        else:
+            resp = await client.post(
+                base + "/v1/chat/completions",
+                json={
+                    "model": model_name,
+                    "messages": messages,
+                    "tools": _TOOLS_SCHEMA,
+                    "temperature": _DRAFT_TEMPERATURE,
+                },
+            )
+            resp.raise_for_status()
+            message = resp.json()["choices"][0]["message"]
+    # Echo back only the fields the API accepts as input — responses also
+    # carry server-side extras (e.g. reasoning_content) that don't belong in
+    # the next request's history.
+    clean: dict = {"role": "assistant", "content": message.get("content") or ""}
+    if message.get("tool_calls"):
+        clean["tool_calls"] = message["tool_calls"]
+    return clean
 
 
 def _snapshot_tree(root: Path) -> dict[str, str]:
@@ -352,6 +379,20 @@ def _fmt_checklist(label: str, items: list[str], detail: str | None = None) -> s
     return line
 
 
+def _normalize_reference_path(reference_path: Path | None) -> tuple[Path | None, str | None]:
+    """_Sandbox scopes 'ref:' access to a *directory* root (list_dir/
+    glob_files need something to list/glob). A user pointing at a single
+    reference file (e.g. one log file, not a folder of them) is a
+    legitimate case — use its parent directory as the root instead of
+    rejecting it. Returns (root_dir, original_file_name_or_None) so the
+    caller can still tell the model exactly which file was meant, instead
+    of leaving it to guess among whatever else lives in that directory.
+    """
+    if reference_path is not None and reference_path.is_file():
+        return reference_path.parent, reference_path.name
+    return reference_path, None
+
+
 async def _run_agent_loop(
     task_description: str,
     repo_path: Path,
@@ -378,17 +419,26 @@ async def _run_agent_loop(
 ) -> tuple[str, _Sandbox]:
     """Runs the tool-calling loop until the model finishes or a hard limit
     is hit. Returns (final_summary_text, sandbox) — raises on abort."""
-    sandbox = _Sandbox(repo_path, reference_path)
+    reference_root, reference_file_hint = _normalize_reference_path(reference_path)
+
+    sandbox = _Sandbox(repo_path, reference_root)
 
     user_parts = [f"任務需求：{task_description}"]
     if task_type:
         user_parts.append(f"任務類型：{task_type}")
-    if reference_path is not None:
+    if reference_root is not None:
+        file_hint_line = (
+            f"－ 使用者指定的參考檔案就是：ref:{reference_file_hint}"
+            f"（絕對路徑：{reference_path}）\n"
+            if reference_file_hint
+            else ""
+        )
         user_parts.append(
-            f"參考資料根目錄：{reference_path}\n"
-            "－ list_dir / glob_files / read_file 這三個工具：用 'ref:' 前綴存取，後面接的路徑/pattern"
+            f"參考資料根目錄：{reference_root}\n"
+            + file_hint_line
+            + "－ list_dir / glob_files / read_file 這三個工具：用 'ref:' 前綴存取，後面接的路徑/pattern"
             "是相對於這個根目錄，不要再重複整個根目錄路徑（例如 'ref:**/CinebenchResults.csv' 是對的，"
-            "'ref:" + str(reference_path) + "\\**\\CinebenchResults.csv' 是錯的，會失敗）。\n"
+            "'ref:" + str(reference_root) + "\\**\\CinebenchResults.csv' 是錯的，會失敗）。\n"
             "－ run_command 這個工具：是真的 shell，完全不認得 'ref:' 前綴，要用上面這個真實絕對路徑本身。"
         )
     if attachment_path:
@@ -434,11 +484,10 @@ async def _run_agent_loop(
             raise TimeoutError(f"Exceeded {_MAX_TASK_SECONDS}s wall-clock budget after {step} step(s).")
 
         try:
-            data = await _call_ollama_chat(messages, model_name)
+            message = await _call_local_chat(messages, model_name)
         except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-            raise TimeoutError(f"Ollama call failed/timed out at step {step}: {exc}") from exc
+            raise TimeoutError(f"Local LLM call failed/timed out at step {step}: {exc}") from exc
 
-        message = data.get("message", {})
         tool_calls = message.get("tool_calls") or []
         messages.append(message)
 
@@ -476,7 +525,10 @@ async def _run_agent_loop(
                     args = {}
             logger.info("dev_agent tool call: {}({})", name, args)
             result = sandbox.dispatch(name, args)
-            messages.append({"role": "tool", "content": result})
+            tool_msg = {"role": "tool", "content": result}
+            if call.get("id"):  # OpenAI format pairs results by id; Ollama's native one has none
+                tool_msg["tool_call_id"] = call["id"]
+            messages.append(tool_msg)
 
     raise TimeoutError(f"Exceeded {_MAX_STEPS} tool-call steps without finishing.")
 
@@ -514,7 +566,7 @@ async def run_dev_agent_task(
     then hands off to Claude Code (_run_review) for the confidence gate."""
     from backend.tasks.project_sync import write_instruction
 
-    model_name = local_model or _DEFAULT_OLLAMA_MODEL
+    model_name = local_model or _DEFAULT_LOCAL_MODEL
     drafted_by = f"{model_name}-local"
 
     repo = Path(repo_path)
