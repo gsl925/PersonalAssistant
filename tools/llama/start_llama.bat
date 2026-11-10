@@ -23,4 +23,6 @@ if not exist "%LLM_MODELS_DIR%" (
 )
 echo Models: %LLM_MODELS_DIR%
 
-"tools\llama\bin\llama-swap\llama-swap.exe" -config "tools\llama\llama-swap.yaml" -listen 127.0.0.1:8090
+REM Port: LLAMA_SWAP_PORT from the environment, default 8090 (what LLAMA_SWAP_BASE_URL expects).
+if not defined LLAMA_SWAP_PORT set "LLAMA_SWAP_PORT=8090"
+"tools\llama\bin\llama-swap\llama-swap.exe" -config "tools\llama\llama-swap.yaml" -listen 127.0.0.1:%LLAMA_SWAP_PORT%

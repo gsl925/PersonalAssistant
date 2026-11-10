@@ -8,7 +8,21 @@
 | `link_ollama_models.ps1` | 把 Ollama 已下載的模型用硬連結接進共用資料夾（不佔空間） |
 | `download_models.ps1` | 從 Hugging Face 下載 GGUF 模型 |
 | `llama-swap.yaml` | 模型清單與載入規則；模型名稱與 `backend/config.py` 的 tier 一致 |
-| `start_llama.bat` | 啟動 llama-swap，監聽 `127.0.0.1:8090`（`start_all.bat` 會自動帶起） |
+| `start_llama.bat` | 啟動 llama-swap，監聽 `127.0.0.1:8090`（`start_all.bat` 會自動帶起；埠號可用環境變數 `LLAMA_SWAP_PORT` 改） |
+| `ensure_llama.ps1` | **給其他專案呼叫**：已經在跑就什麼都不做，沒在跑就啟動並等到可用（見下一節） |
+
+## 其他專案怎麼用這台 llama-swap
+
+整台電腦共用**同一個** llama-swap（埠 8090）與同一個模型資料夾，其他專案不要自己再裝一份。要連線前，在它自己的啟動腳本裡先呼叫一次：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "<本 repo 路徑>\tools\llama\ensure_llama.ps1"
+```
+
+- 已在跑 → 立刻結束（exit 0）；沒在跑 → 開一個 llama-swap 視窗並等到可回應（預設最久 120 秒，逾時 exit 1）。可重複呼叫，不會撞埠。
+- 它會自己找到這個 repo 的設定與模型資料夾，從任何工作目錄呼叫都可以。
+- 連線位址是 `http://localhost:8090`（OpenAI 相容：`/v1/chat/completions`、`/v1/embeddings`），模型名稱與 Ollama 一致。
+- 需要新模型時，改這個 repo 的 `llama-swap.yaml`，不要另開一份。
 
 ## 使用步驟
 
