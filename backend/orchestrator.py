@@ -1409,6 +1409,23 @@ class Orchestrator:
         # Run the agent with retry logic
         agent_result = await self._execute_agent_with_retry(skill, processed)
 
+        # Additive long-form video digest (sectioned summary + timestamps +
+        # confidence score) — Dashboard-only, never touches the agent's own
+        # summary/key_points/tags. A failure here must not fail the save.
+        if agent_name == "webclip-agent" and processed.metadata.get("is_video"):
+            try:
+                from backend.video_digest import generate_video_digest
+
+                transcript = processed.corrected_content or processed.original_content or ""
+                digest = await generate_video_digest(
+                    self.model_router, transcript, processed.title, str(settings.BASE_DIR)
+                )
+                type_specific_data = dict(agent_result.get("type_specific_data") or {})
+                type_specific_data["video_digest"] = digest
+                agent_result["type_specific_data"] = type_specific_data
+            except Exception as exc:  # noqa: BLE001 — never block the save over this
+                logger.warning("video_digest generation failed for doc {}: {}", doc_id, exc)
+
         # Persist structured results
         async with self._session_maker() as db:
             await crud.update_document_status(

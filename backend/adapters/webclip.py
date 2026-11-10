@@ -15,7 +15,7 @@ from youtube_transcript_api._errors import CouldNotRetrieveTranscript
 
 from backend.adapters.base import BaseAdapter, ProcessedContent
 from backend.adapters.transcript_correction import correct_transcript
-from backend.adapters.whisper_utils import _S2TWP, transcribe_audio
+from backend.adapters.whisper_utils import _S2TWP, format_timestamp, transcribe_audio
 
 _FETCH_TIMEOUT = 30.0
 _INVESTMENT_PATTERNS = re.compile(
@@ -24,6 +24,7 @@ _INVESTMENT_PATTERNS = re.compile(
 )
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
 _TRANSCRIPT_LANGUAGE_PREFERENCE = ["zh-Hant", "zh-Hans", "zh-TW", "zh-CN", "zh", "en"]
+_TIMESTAMP_BUCKET_SECONDS = 30.0
 
 
 class WebclipAdapter(BaseAdapter):
@@ -115,7 +116,27 @@ class WebclipAdapter(BaseAdapter):
             logger.warning("Unexpected error fetching transcript for {}: {}", video_id, exc)
             return None
 
-        text = " ".join(snippet.text for snippet in fetched).strip()
+        if not fetched:
+            return None
+
+        # Bucket consecutive snippets into ~30s windows prefixed with
+        # [MM:SS], matching the whisper fallback path's timestamped format —
+        # without this, a captioned video's transcript has no time markers
+        # at all for a later summarizer to cite.
+        lines: list[str] = []
+        bucket_start: float | None = None
+        bucket_parts: list[str] = []
+        for snippet in fetched:
+            if bucket_start is None:
+                bucket_start = snippet.start
+            bucket_parts.append(snippet.text)
+            if snippet.start - bucket_start >= _TIMESTAMP_BUCKET_SECONDS:
+                lines.append(f"[{format_timestamp(bucket_start)}] {' '.join(bucket_parts)}")
+                bucket_start, bucket_parts = None, []
+        if bucket_parts and bucket_start is not None:
+            lines.append(f"[{format_timestamp(bucket_start)}] {' '.join(bucket_parts)}")
+
+        text = "\n".join(lines).strip()
         # YouTube's own (auto-generated or uploaded) caption tracks skew
         # Simplified for Chinese the same way whisper does — see
         # whisper_utils._S2TWP. Applying it here too so this path isn't
@@ -130,7 +151,7 @@ class WebclipAdapter(BaseAdapter):
             return None
         audio_path, tmp_dir = downloaded
         try:
-            transcript = await transcribe_audio(audio_path)
+            transcript = await transcribe_audio(audio_path, with_timestamps=True)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
