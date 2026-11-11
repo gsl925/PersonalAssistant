@@ -25,4 +25,10 @@ echo Models: %LLM_MODELS_DIR%
 
 REM Port: LLAMA_SWAP_PORT from the environment, default 8090 (what LLAMA_SWAP_BASE_URL expects).
 if not defined LLAMA_SWAP_PORT set "LLAMA_SWAP_PORT=8090"
+REM Skip if something already listens there: the one shared llama-swap serves every project.
+netstat -ano | findstr /R /C:":%LLAMA_SWAP_PORT% .*LISTENING" >nul
+if not errorlevel 1 (
+    echo llama-swap already running on :%LLAMA_SWAP_PORT%, skipping.
+    exit /b 0
+)
 "tools\llama\bin\llama-swap\llama-swap.exe" -config "tools\llama\llama-swap.yaml" -listen 127.0.0.1:%LLAMA_SWAP_PORT%
