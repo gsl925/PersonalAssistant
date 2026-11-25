@@ -32,8 +32,10 @@ DEFAULT_CAPABILITY_TIERS: CapabilityTiers = {
     "fast_text": [
         {"provider": "local", "model": "qwen3:8b"},
     ],
+    # -kvq8 = same model with a q8_0 KV cache (llama-swap.yaml): the plain id at
+    # -c 32768 overflows 16 GB VRAM and spills layers to the CPU (14 cores busy).
     "complex_reasoning": [
-        {"provider": "local", "model": "deepseek-r1:14b"},
+        {"provider": "local", "model": "deepseek-r1:14b-kvq8"},
     ],
     "vision": [
         {"provider": "local", "model": "qwen3-vl:8b"},
@@ -87,7 +89,7 @@ DEFAULT_CAPABILITY_TIERS: CapabilityTiers = {
     # so it stays as the fallback).
     "insight_extraction": [
         {"provider": "local", "model": "gemma4:26b"},
-        {"provider": "local", "model": "deepseek-r1:14b"},
+        {"provider": "local", "model": "deepseek-r1:14b-kvq8"},
     ],
     # Video digest (backend/video_digest.py): deliberately single-entry, no
     # fallback chain — unlike every tier above, this pair is called together
@@ -96,7 +98,7 @@ DEFAULT_CAPABILITY_TIERS: CapabilityTiers = {
     # point of comparing them. A model failing here is handled by
     # video_digest.py itself (degrade to the other draft), not by the router.
     "video_digest_local": [
-        {"provider": "local", "model": "deepseek-r1:14b"},
+        {"provider": "local", "model": "deepseek-r1:14b-kvq8"},
     ],
     # Tier name is historical: gpt-oss:120b-cloud used to fill this slot. Now
     # local-only, so a second, different local model supplies the other draft.
