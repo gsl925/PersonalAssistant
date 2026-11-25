@@ -33,6 +33,18 @@ if (-not $backendWasUp) {
         -WorkingDirectory $root
 }
 
+# llama-swap (the local LLM server on :8090) is needed by dev_agent, KB Q&A,
+# video digests, etc., so make sure it is answering. ensure_llama.ps1 does
+# nothing if it already responds, and waits up to 120 s otherwise - far past
+# this hook's 30 s timeout - so run it in a detached hidden process instead of
+# blocking here. Skipped when the llama.cpp binaries were never downloaded.
+if (Test-Path "$root\tools\llama\bin") {
+    Start-Process -FilePath "powershell.exe" -WindowStyle Hidden -ArgumentList @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", "$root\tools\llama\ensure_llama.ps1"
+    )
+}
+
 if (-not $widgetWasUp) {
     # Launch electron.exe directly instead of routing through npm/cmd, so no
     # console window ever appears — the widget only shows up as a tray icon.
